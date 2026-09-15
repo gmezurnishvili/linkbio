@@ -48,6 +48,13 @@ export async function clearTokens() {
   jar.delete(REFRESH);
 }
 
+export class ExchangeFailure extends Error {
+  constructor(readonly status: number) {
+    super(`Auth exchange failed with ${status}`);
+    this.name = "ExchangeFailure";
+  }
+}
+
 export interface TokenResponse {
   accessToken: string;
   refreshToken?: string;
@@ -55,9 +62,9 @@ export interface TokenResponse {
 }
 
 export async function exchange(
-  path: "/v1/auth/token" | "/v1/auth/refresh",
+  path: "/v1/auth/token" | "/v1/auth/refresh" | "/v1/auth/register",
   body: unknown,
-): Promise<TokenResponse | null> {
+): Promise<TokenResponse> {
   const origin = process.env.API_ORIGIN;
   if (!origin) throw new Error("API_ORIGIN is not set");
 
@@ -67,7 +74,11 @@ export async function exchange(
     body: JSON.stringify(body),
     cache: "no-store",
   });
-  if (!res.ok) return null;
+  if (!res.ok) {
+    // Registration needs to tell "email already taken" apart from a generic
+    // failure, so the status comes back rather than being flattened to null.
+    throw new ExchangeFailure(res.status);
+  }
   return (await res.json()) as TokenResponse;
 }
 
@@ -77,8 +88,12 @@ export async function currentAccessToken(): Promise<string | null> {
   if (access) return access;
   if (!refresh) return null;
 
-  const next = await exchange("/v1/auth/refresh", { refreshToken: refresh });
-  if (!next) {
+  let next: TokenResponse;
+  try {
+    next = await exchange("/v1/auth/refresh", { refreshToken: refresh });
+  } catch {
+    // The refresh token is spent or revoked. Drop both so the next navigation
+    // lands on sign-in rather than looping.
     await clearTokens();
     return null;
   }

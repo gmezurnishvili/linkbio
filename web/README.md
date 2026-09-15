@@ -152,3 +152,156 @@ The tests cover the pure logic that is easy to get wrong and hard to notice:
 fractional rank splitting at a tight seam, DST gap and ambiguity detection
 against fixed 2027 transitions, `s-maxage` clamping and flooring, mask
 derivation, HTML escaping, and handle shape.
+
+## Running it with the backend
+
+Nothing here needs AWS. Two processes, two terminals.
+
+```sh
+# terminal 1 — the Hono server, in-memory
+cd ../api && DB_DRIVER=memory PORT=8787 npm run dev
+
+# terminal 2 — this app
+cd web && cp .env.example .env.local && npm install && npm run dev
+```
+
+`.env.local` only needs `API_ORIGIN=http://localhost:8787`. The browser never
+talks to the backend directly except for the click beacon, so there is no CORS
+to configure — everything else goes through `/api/proxy` on port 3000. The
+beacon endpoint does get hit cross-origin, by `sendBeacon` with a `text/plain`
+body: that is a simple request, so no preflight, but it must accept a POST with
+no `Authorization` header.
+
+### Before the real backend can drive this
+
+Four things the frontend assumes:
+
+1. `POST /v1/public/:handle/resolve` and `POST /v1/profiles/:id/preview`, both
+   returning `Resolution` — blocks, `sMaxAge`, `varyOn`, `trace`, `warnings`.
+2. `GET /v1/me` returning the signed-in user and their profiles.
+3. Every write accepts `If-Match: <version>`, returns 409 when stale, and
+   answers `{ data, version, cacheDimensions }` on success.
+4. `POST /v1/auth/token` and `/v1/auth/refresh` returning
+   `{ accessToken, refreshToken, expiresIn }`. Local HS256 is fine for dev.
+
+### Running against the mock instead
+
+`dev/mock-api.mjs` implements all of the above in memory, with one seeded
+profile at `/giorgi` carrying a country rule, an iOS rewrite, and a late-night
+window that crosses both midnight and a DST fall-back.
+
+```sh
+npm run dev:mock      # mock on 8787, Next on 3000
+```
+
+Sign in at `/login` with any email and password. The mock's rule evaluation is
+a stand-in, not a port of the real one — notably it finds `sMaxAge` by scanning
+forward a minute at a time, and does no DST gap or ambiguity detection. Where
+the two disagree, the real evaluator is right.
+
+### Probing it
+
+Visitor context comes entirely from request headers, so curl can be any visitor
+without a VPN, a device lab, or waiting until Saturday night:
+
+```sh
+npm run probe                      # the matrix below
+dev/probe.sh giorgi https://…      # or against a deployed origin
+```
+
+```
+no context            200  s-maxage=3600  Presave -> open.spotify.com  Merch -> shop.example.com
+US · iPhone           200  s-maxage=3600  feed:Tour dates  Presave -> music.apple.com  Merch -> …
+US · Android          200  s-maxage=3600  feed:Tour dates  Presave -> open.spotify.com  Merch -> …
+DE · desktop          200  s-maxage=3600  Presave -> open.spotify.com  Merch -> shop.example.com
+```
+
+Three things that row set is checking: the country rule adds the tour feed for
+US and CA only, the OS rule rewrites the presave destination for iOS without
+changing the stored URL, and `vary` lists only the dimensions the rules
+actually read.
+
+Nothing caches locally, so this shows what CloudFront would be *told*, not what
+it would do. To watch `s-maxage` change as a time window opens, move the
+`datetime-local` field in the simulator — it sends an injected instant and the
+trace prints the boundary. To exercise the real cache, deploy, or point a
+caching proxy at port 3000.
+
+### Checks worth running by hand
+
+```sh
+# no session -> 401, session -> proxied
+curl -i localhost:3000/api/proxy/v1/me
+curl -b 'lc_at=dev.fake' localhost:3000/api/proxy/v1/me
+
+# stale If-Match -> 409, which is what raises the conflict banner
+curl -X PATCH -b 'lc_at=dev.fake' -H 'if-match: 1' \
+  -H 'content-type: application/json' -d '{"displayName":"X"}' \
+  localhost:3000/api/proxy/v1/profiles/p_1
+```
+
+In the dashboard, the conflict path is worth seeing once: open the editor in two
+tabs, edit a block in one, then drag a block in the other. The second tab stops
+accepting writes and offers to reload rather than overwriting.
+
+## Registering a user and seeing the page
+
+In the browser, with the mock or a backend that supports it:
+
+1. `/signup` — email and password. The server action posts to
+   `/v1/auth/register`, writes the cookies, and sends you to onboarding.
+2. `/app/new` — pick a handle. Availability is checked as you type;
+   the profile and the claim happen in one transaction server-side.
+3. `/app/:id` — add a block or two, then **Publish**.
+4. `/:handle` — the public page. Or click "View live" in the header.
+
+Publishing matters at step 3: a page with `publishedVersion: null` is a draft.
+The mock resolves live data regardless, so a brand-new page renders immediately
+there; decide what the real backend should do with an unpublished handle —
+404 is the defensible answer.
+
+To check the same flow without a browser:
+
+```sh
+dev/register-flow.sh                      # random email and handle
+dev/register-flow.sh me@studio.com giorgi2
+```
+
+```
+registering someone+1789502585@studio.com
+session:      {"userId":"u_2e9eff","email":"…","profiles":[]}
+handle check: {"available":true}
+created:      p_1eacc8 at /newpage2585
+claim again:  409 (409 means the claim is transactional)
+added a link
+
+public page at http://localhost:3000/newpage2585:
+  name: Test page
+  block-label: My album
+  block-meta: example.com
+```
+
+Registration posts straight to the API because it runs in a server action
+before any cookie exists. Everything after it goes through `/api/proxy`, the
+way the browser does.
+
+### Two more endpoints this needs
+
+On top of the four listed above:
+
+```
+POST /v1/auth/register   { email, password } -> tokens, 409 if email taken
+POST /v1/profiles        { handle, displayName } -> Profile, 409 if handle taken
+```
+
+The profile creation and the handle claim have to be one transaction. Two calls
+would leave a profile with no handle whenever the second one lost a race, and
+the frontend has no sensible way to recover from that state.
+
+### Signing in as the seeded account
+
+The mock ships one profile at `/giorgi` owned by `you@studio.com`. Sign in at
+`/login` with that email and any password to edit it — it has a country rule, an
+iOS rewrite, and a late-night window already set up, so the simulator has
+something to show. Registering a new account leaves it in place: profiles are
+scoped by owner, so `giorgi` still reads as taken.

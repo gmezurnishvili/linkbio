@@ -1,21 +1,26 @@
-import { redirect } from "next/navigation";
 import Link from "next/link";
-import { exchange, writeTokens } from "@/lib/auth/session";
+import { redirect } from "next/navigation";
+import { ExchangeFailure, exchange, writeTokens } from "@/lib/auth/session";
 
 export const dynamic = "force-dynamic";
 
-async function signIn(formData: FormData) {
+async function register(formData: FormData) {
   "use server";
 
   const email = String(formData.get("email") ?? "").trim();
   const password = String(formData.get("password") ?? "");
-  if (!email || !password) redirect("/login?error=missing");
+  if (!email || !password) redirect("/signup?error=missing");
+  if (password.length < 10) redirect("/signup?error=short");
 
   let tokens;
   try {
-    tokens = await exchange("/v1/auth/token", { email, password });
-  } catch {
-    redirect("/login?error=denied");
+    tokens = await exchange("/v1/auth/register", { email, password });
+  } catch (err) {
+    // 409 is the one failure worth naming. Anything else is ours, not theirs.
+    if (err instanceof ExchangeFailure && err.status === 409) {
+      redirect("/signup?error=taken");
+    }
+    redirect("/signup?error=unavailable");
   }
 
   await writeTokens({
@@ -23,30 +28,33 @@ async function signIn(formData: FormData) {
     refresh: tokens.refreshToken,
     expiresIn: tokens.expiresIn,
   });
-  redirect("/app");
+
+  // Registered, but there is no page yet. Onboarding claims the handle.
+  redirect("/app/new");
 }
 
 const MESSAGES: Record<string, string> = {
-  missing: "Enter your email and password.",
-  denied: "That email and password don't match an account.",
-  expired: "Your session expired. Sign in again.",
+  missing: "Enter an email and a password.",
+  short: "Ten characters at least.",
+  taken: "There's already an account on this email. Sign in instead.",
+  unavailable: "Couldn't create the account. Try again in a moment.",
 };
 
-export default async function LoginPage({
+export default async function SignupPage({
   searchParams,
 }: {
   searchParams: Promise<{ error?: string }>;
 }) {
   const { error } = await searchParams;
-  const message = error ? MESSAGES[error] ?? MESSAGES.denied : null;
+  const message = error ? MESSAGES[error] ?? MESSAGES.unavailable : null;
 
   return (
     <main className="grid min-h-screen place-items-center px-6">
       <div className="w-full max-w-[21rem]">
-        <h1 className="text-[1.375rem] font-semibold tracking-[-0.018em]">Sign in</h1>
-        <p className="mt-1 text-sm text-muted">Your pages keep serving while you're away.</p>
+        <h1 className="text-[1.375rem] font-semibold tracking-[-0.018em]">Create an account</h1>
+        <p className="mt-1 text-sm text-muted">You'll pick your handle next.</p>
 
-        <form action={signIn} className="mt-7 flex flex-col gap-3">
+        <form action={register} className="mt-7 flex flex-col gap-3">
           <label className="flex flex-col gap-1.5">
             <span className="text-[0.8125rem] text-muted">Email</span>
             <input
@@ -64,10 +72,12 @@ export default async function LoginPage({
             <input
               name="password"
               type="password"
-              autoComplete="current-password"
+              autoComplete="new-password"
               required
+              minLength={10}
               className="h-10 rounded-desk border border-line bg-panel px-3 text-[0.9375rem] outline-none focus:border-geo"
             />
+            <span className="text-[0.75rem] text-faint">Ten characters or more.</span>
           </label>
 
           {message ? (
@@ -80,14 +90,14 @@ export default async function LoginPage({
             type="submit"
             className="mt-1 h-10 rounded-desk bg-ink text-[0.9375rem] font-medium text-white transition-opacity hover:opacity-90 active:opacity-80"
           >
-            Sign in
+            Create account
           </button>
         </form>
 
         <p className="mt-5 text-[0.8125rem] text-muted">
-          No account yet?{" "}
-          <Link href="/signup" className="text-ink underline">
-            Create one
+          Already have one?{" "}
+          <Link href="/login" className="text-ink underline">
+            Sign in
           </Link>
         </p>
       </div>

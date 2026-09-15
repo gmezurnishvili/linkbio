@@ -88,6 +88,13 @@ export const api = {
 
   /* ---- profile ---------------------------------------------------------- */
 
+  /**
+   * Creates the profile and claims the handle in one transaction. Two calls
+   * would leave a profile with no handle if the second one lost a race.
+   */
+  createProfile: (input: { handle: string; displayName: string }, o?: CallOptions) =>
+    call<Profile>("POST", "/v1/profiles", input, o),
+
   profile: (id: string, o?: CallOptions) =>
     call<Profile>("GET", `/v1/profiles/${id}`, undefined, o),
 
