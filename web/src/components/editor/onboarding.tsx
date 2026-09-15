@@ -79,6 +79,9 @@ export function Onboarding({ suggestion }: { suggestion: string }) {
   const reasons: Record<string, string> = {
     taken: "Someone has this one.",
     reserved: "This one is reserved.",
+    // The form's own check catches almost every one of these first; this is
+    // for the handful where the backend's rule is stricter than ours.
+    invalid: "Lowercase letters, numbers, dashes and underscores only.",
     tombstoned:
       "Recently released. It stays held for 90 days so old links don't land on a stranger's page.",
   };

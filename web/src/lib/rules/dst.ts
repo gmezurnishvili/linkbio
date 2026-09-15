@@ -13,6 +13,7 @@ import type { RuleWarning, TimeWindow } from "@/lib/api/types";
  */
 
 const MINUTE = 60_000;
+const DAY = 24 * 60;
 
 /** Zone offset in minutes at an instant, from Intl's own data. */
 export function offsetAt(timezone: string, instant: number): number {
@@ -90,11 +91,22 @@ function toMinutes(hhmm: string): number {
 function overlaps(window: TimeWindow, from: number, to: number): boolean {
   const start = toMinutes(window.start);
   const end = toMinutes(window.end);
-  const spans = end > start ? [[start, end]] : [
-    [start, 24 * 60],
+  const spans: [number, number][] = end > start ? [[start, end]] : [
+    [start, DAY],
     [0, end],
   ];
-  return spans.some(([s, e]) => s! < to && from < e!);
+  // A transition at local midnight puts its range past the end of the day, so
+  // both sides have to be folded back onto one 0–1440 clock before comparing.
+  const range = daySpans(from, to);
+  return spans.some(([s, e]) => range.some(([f, t]) => s < t && f < e));
+}
+
+/** A [from, to) range as the one or two spans it covers within a single day. */
+function daySpans(from: number, to: number): [number, number][] {
+  if (to - from >= DAY) return [[0, DAY]];
+  const f = ((from % DAY) + DAY) % DAY;
+  const t = f + (to - from);
+  return t <= DAY ? [[f, t]] : [[f, DAY], [0, t - DAY]];
 }
 
 export function windowWarnings(window: TimeWindow): RuleWarning[] {
@@ -115,17 +127,22 @@ export function windowWarnings(window: TimeWindow): RuleWarning[] {
 
     if (t.shift > 0) {
       // Spring forward: the local minutes between the two readings never occur.
+      // Measuring the gap from the reading before the change rather than from
+      // the one after it is what keeps a midnight transition visible — there
+      // the clock runs off the end of one day and lands on the next.
       const from = before.minutes + 1;
-      const to = after.minutes;
-      if (to > from && overlaps(window, from, to)) {
+      const to = from + t.shift;
+      const onDate = from >= DAY ? after.date : before.date;
+      if (overlaps(window, from, to)) {
         out.push({
           code: "dst-gap",
-          onDate: after.date,
-          message: `On ${after.date} the clocks skip ${fmt(from)}–${fmt(to)} in ${window.timezone}. Part of this window doesn't exist that day.`,
+          onDate,
+          message: `On ${onDate} the clocks skip ${fmt(from)}–${fmt(to)} in ${window.timezone}. Part of this window doesn't exist that day.`,
         });
       }
     } else if (t.shift < 0) {
       // Fall back: the local minutes after the change repeat an earlier hour.
+      // `to` can run past midnight, which is why the overlap test wraps.
       const from = after.minutes;
       const to = after.minutes - t.shift;
       if (overlaps(window, from, to)) {

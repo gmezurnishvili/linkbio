@@ -5,7 +5,8 @@ import { cacheControlFor, osFromUserAgent } from "./context/visitor";
 import { deriveCacheDimensions, estimateVariants } from "./rules/language";
 import { esc, varyHeader } from "./site/render";
 import { handleProblem, isReserved } from "./handles";
-import type { Rule, TimeWindow } from "./api/types";
+import type { TimeWindow } from "./api/types";
+import type { BlockRule } from "./rules/schema";
 
 describe("rankBetween", () => {
   it("lands strictly between its bounds", () => {
@@ -122,64 +123,42 @@ describe("cacheControlFor", () => {
 });
 
 describe("cache dimension derivation", () => {
-  const rule = (over: Partial<Rule>): Rule => ({
-    id: "r1",
-    name: "r",
-    conditions: [],
-    effect: { type: "show" },
+  const rule = (id: string, when: BlockRule["when"]): BlockRule => ({
+    id,
     priority: 10,
-    enabled: true,
-    ...over,
+    when,
+    then: { kind: "hide" },
   });
 
-  it("collects dimensions from enabled rules only", () => {
+  it("collects the dimension of every condition on the page", () => {
+    // There is no enabled flag any more: a saved rule is a live rule, and the
+    // way to stop one applying is to delete it.
     const rules = [
-      rule({ conditions: [{ dimension: "country", op: "in", values: ["US"] }] }),
-      rule({
-        id: "r2",
-        enabled: false,
-        conditions: [{ dimension: "device", op: "in", values: ["mobile"] }],
-      }),
+      rule("r1", [{ dim: "geo", in: ["na"] }]),
+      rule("r2", [{ dim: "device", in: ["mobile"] }]),
     ];
-    expect(deriveCacheDimensions(rules)).toEqual(["country"]);
+    expect(deriveCacheDimensions(rules)).toEqual(["geo", "device"]);
   });
 
-  it("leaves a fixed-zone time window out of the key", () => {
-    const rules = [
-      rule({
-        conditions: [
-          {
-            dimension: "time",
-            op: "within",
-            window: { timezone: "Europe/Berlin", daysOfWeek: [], start: "18:00", end: "23:00" },
-          },
-        ],
-      }),
-    ];
-    expect(deriveCacheDimensions(rules)).toEqual([]);
-  });
-
-  it("adds a timezone bucket for visitor-local windows", () => {
-    const rules = [
-      rule({
-        conditions: [
-          {
-            dimension: "time",
-            op: "within",
-            window: { timezone: "viewer", daysOfWeek: [], start: "18:00", end: "23:00" },
-          },
-        ],
-      }),
-    ];
-    expect(deriveCacheDimensions(rules)).toEqual(["tz-bucket"]);
+  it("reports a time window, which bounds the TTL rather than splitting the key", () => {
+    // `cacheDimensionsFor` in api/src/publish.ts appends `time` outside the
+    // mask for exactly this reason, and the cost panel is about both.
+    const rules = [rule("r1", [{ dim: "time", tz: "Europe/Berlin", from: "18:00", to: "23:00" }])];
+    expect(deriveCacheDimensions(rules)).toEqual(["time"]);
   });
 
   it("counts each named value plus a fallthrough bucket", () => {
     const rules = [
-      rule({ conditions: [{ dimension: "country", op: "in", values: ["US", "CA"] }] }),
-      rule({ id: "r2", conditions: [{ dimension: "device", op: "in", values: ["mobile"] }] }),
+      rule("r1", [{ dim: "geo", in: ["na", "eu"] }]),
+      rule("r2", [{ dim: "device", in: ["mobile"] }]),
     ];
     expect(estimateVariants(rules)).toBe(6);
+  });
+
+  it("gives a boolean two buckets, not three", () => {
+    // `webview` has nothing to fall through to, so the +1 above would be
+    // inventing a third kind of visitor.
+    expect(estimateVariants([rule("r1", [{ dim: "webview", is: true }])])).toBe(2);
   });
 });
 
@@ -192,6 +171,27 @@ describe("html rendering", () => {
     expect(varyHeader(["country", "language"])).toBe(
       "CloudFront-Viewer-Country, Accept-Language",
     );
+  });
+
+  it("covers every dimension the backend reports", () => {
+    // geo, lang and webview used to fall out of the map and be dropped by a
+    // `.filter(Boolean)`, so a page keyed on all three shipped no Vary at all.
+    expect(varyHeader(["geo", "lang", "webview"])).toBe(
+      "CloudFront-Viewer-Country, Accept-Language, User-Agent",
+    );
+  });
+
+  it("does not repeat a header two dimensions share", () => {
+    expect(varyHeader(["lang", "language"])).toBe("Accept-Language");
+  });
+
+  it("leaves time out: it bounds the TTL rather than splitting the key", () => {
+    expect(varyHeader(["time"])).toBeNull();
+    expect(varyHeader(["geo", "time"])).toBe("CloudFront-Viewer-Country");
+  });
+
+  it("widens to * for a dimension it cannot express, rather than dropping it", () => {
+    expect(varyHeader(["geo", "hour-of-day"])).toBe("*");
   });
 
   it("omits vary entirely when nothing fragments", () => {
@@ -211,14 +211,18 @@ describe("user agent parsing", () => {
 
 describe("handles", () => {
   it("accepts ordinary handles", () => {
-    for (const h of ["giorgi", "g1", "dj-giorgi", "giorgi.official", "a_b_c"]) {
+    for (const h of ["giorgi", "g1", "dj-giorgi", "a_b_c"]) {
       expect(handleProblem(h)).toBeNull();
     }
   });
 
-  it("rejects near-duplicate shapes that read as impersonation", () => {
+  it("rejects dots, which the backend's claim would reject anyway", () => {
+    expect(handleProblem("giorgi.official")).not.toBeNull();
     expect(handleProblem("giorgi..official")).not.toBeNull();
     expect(handleProblem("giorgi.")).not.toBeNull();
+  });
+
+  it("rejects near-duplicate shapes that read as impersonation", () => {
     expect(handleProblem("-giorgi")).not.toBeNull();
     expect(handleProblem("giorgi--official")).not.toBeNull();
   });

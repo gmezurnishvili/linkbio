@@ -69,11 +69,12 @@ body {
   }
 }
 
-/* dnd-kit lifts the dragged row out of flow; the placeholder below it should
-   read as a slot, not as an empty card. */
+/* The dragged row stays in the list while a DragOverlay copy follows the
+   pointer. What is left behind is the slot the drop will land in, so it reads
+   as a dimmed placeholder rather than as an empty card. */
 .is-dragging {
   background: var(--color-sunk);
 }
 .is-dragging > * {
-  opacity: 0;
+  opacity: 0.35;
 }

@@ -9,14 +9,14 @@ import {
   useRef,
   type ReactNode,
 } from "react";
-import { api } from "@/lib/api/client";
+import { api, toBlock, toProfile } from "@/lib/api/client";
 import {
   ApiError,
   type Block,
   type CacheDimension,
   type Profile,
-  type Rule,
 } from "@/lib/api/types";
+import type { BlockRule } from "@/lib/rules/schema";
 import { byRank, rankBetween } from "@/lib/rank";
 
 /**
@@ -28,14 +28,15 @@ import { byRank, rankBetween } from "@/lib/rank";
  * kept editing against the old one it would write against a mask that no
  * longer describes the page — which fails silently rather than loudly. So the
  * store treats version and cacheDimensions as things only the server may set,
- * and a 409 stops writes until the creator reloads rather than retrying.
+ * and a stale If-Match stops writes until the creator reloads rather than
+ * retrying.
  */
 
 interface State {
   profile: Profile;
   /** Ids with a write in flight, for per-row disabled state. */
   pending: Set<string>;
-  /** Set on 409. Every further write is blocked while this is true. */
+  /** Set on a stale If-Match. Every further write is blocked while this is true. */
   conflict: boolean;
   error: string | null;
 }
@@ -43,16 +44,26 @@ interface State {
 type Action =
   | { type: "apply"; version: number; cacheDimensions: CacheDimension[] }
   | { type: "replace"; profile: Profile }
+  /**
+   * Undoing an optimistic edit, which is a different thing from applying a
+   * server answer.
+   *
+   * They used to share `"replace"`, and `"replace"` cleared `conflict` — so
+   * `updateProfileFields` set the lock on a 409 and then immediately cleared it
+   * again by rolling back, and the banner never appeared for a profile edit.
+   * Only `"loaded"` clears the lock now, because reloading is the only thing
+   * that actually resolves one.
+   */
+  | { type: "rollback"; profile: Profile }
+  | { type: "loaded"; profile: Profile }
   | { type: "blocks"; blocks: Block[] }
   | { type: "upsertBlock"; block: Block }
   | { type: "removeBlock"; id: string }
-  | { type: "upsertRule"; rule: Rule }
-  | { type: "removeRule"; id: string }
   | { type: "pending"; id: string; on: boolean }
   | { type: "conflict" }
   | { type: "error"; message: string | null };
 
-function reducer(state: State, action: Action): State {
+export function reducer(state: State, action: Action): State {
   switch (action.type) {
     case "apply":
       return {
@@ -64,6 +75,10 @@ function reducer(state: State, action: Action): State {
         },
       };
     case "replace":
+      return { ...state, profile: action.profile, error: null };
+    case "rollback":
+      return { ...state, profile: action.profile };
+    case "loaded":
       return { ...state, profile: action.profile, conflict: false, error: null };
     case "blocks":
       return { ...state, profile: { ...state.profile, blocks: action.blocks } };
@@ -82,25 +97,6 @@ function reducer(state: State, action: Action): State {
           blocks: state.profile.blocks.filter((b) => b.id !== action.id),
         },
       };
-    case "upsertRule": {
-      const exists = state.profile.rules.some((r) => r.id === action.rule.id);
-      const rules = exists
-        ? state.profile.rules.map((r) => (r.id === action.rule.id ? action.rule : r))
-        : [...state.profile.rules, action.rule];
-      return { ...state, profile: { ...state.profile, rules } };
-    }
-    case "removeRule":
-      return {
-        ...state,
-        profile: {
-          ...state.profile,
-          rules: state.profile.rules.filter((r) => r.id !== action.id),
-          blocks: state.profile.blocks.map((b) => ({
-            ...b,
-            ruleIds: b.ruleIds.filter((id) => id !== action.id),
-          })),
-        },
-      };
     case "pending": {
       const pending = new Set(state.pending);
       if (action.on) pending.add(action.id);
@@ -114,6 +110,16 @@ function reducer(state: State, action: Action): State {
   }
 }
 
+/**
+ * A completed write, tagged.
+ *
+ * `null` used to mean "it failed", which made a successful DELETE — 204, no
+ * body — indistinguishable from an error, and the editor rolled the row back
+ * in front of the creator while the server had in fact deleted it. Success and
+ * the value are now separate facts.
+ */
+type Guarded<T> = { ok: true; value: T } | { ok: false };
+
 export interface ProfileOps {
   updateProfileFields(
     patch: Partial<
@@ -125,8 +131,8 @@ export interface ProfileOps {
   createBlock(input: Pick<Block, "kind" | "label"> & Partial<Block>): Promise<void>;
   updateBlock(blockId: string, patch: Partial<Block>): Promise<void>;
   deleteBlock(blockId: string): Promise<void>;
-  saveRule(rule: Omit<Rule, "id" | "warnings"> & { id?: string }): Promise<Rule | null>;
-  deleteRule(ruleId: string): Promise<void>;
+  /** Replaces the block's whole rule set. Returns false if the write did not land. */
+  saveBlockRules(blockId: string, rules: BlockRule[]): Promise<boolean>;
   publish(): Promise<void>;
   reload(): Promise<void>;
   dismissError(): void;
@@ -148,19 +154,42 @@ export function ProfileProvider({
     error: null,
   });
 
-  // Reads the latest state inside async callbacks without making every op
-  // depend on the render that started it.
-  const ref = useRef(state);
-  ref.current = state;
+  /**
+   * The authoritative profile version, written by the code that dispatches
+   * rather than by render.
+   *
+   * It used to be `ref.current = state` during render, which is only fresh
+   * once React has re-rendered. Two writes issued from the same async
+   * continuation — the block sheet saves a label and then its rules — both read
+   * the version from before the first one, so the second arrived with a stale
+   * If-Match and came back 409 every time. Keeping just the version, updated
+   * the moment a response carries a new one, means the second write sees what
+   * the first one earned.
+   */
+  const versionRef = useRef(initial.version);
+  const conflictRef = useRef(false);
+  const blocksRef = useRef(state.profile.blocks);
+  const profileRef = useRef(state.profile);
+  profileRef.current = state.profile;
+  blocksRef.current = state.profile.blocks;
+
+  const applyVersion = useCallback((version: number, cacheDimensions: CacheDimension[]) => {
+    versionRef.current = version;
+    dispatch({ type: "apply", version, cacheDimensions });
+  }, []);
 
   const guard = useCallback(
-    async <T,>(id: string, run: (version: number) => Promise<T>): Promise<T | null> => {
-      if (ref.current.conflict) return null;
+    async <T,>(id: string, run: (version: number) => Promise<T>): Promise<Guarded<T>> => {
+      if (conflictRef.current) return { ok: false };
       dispatch({ type: "pending", id, on: true });
       try {
-        return await run(ref.current.profile.version);
+        return { ok: true, value: await run(versionRef.current) };
       } catch (err) {
         if (err instanceof ApiError && err.isVersionConflict) {
+          conflictRef.current = true;
+          // The server tells us what it holds, so the banner's reload is a read
+          // rather than a guess.
+          if (err.current !== null) versionRef.current = err.current;
           dispatch({ type: "conflict" });
         } else if (err instanceof ApiError && err.isUnauthorized) {
           window.location.href = "/login?error=expired";
@@ -170,7 +199,7 @@ export function ProfileProvider({
             message: err instanceof Error ? err.message : "That didn't save.",
           });
         }
-        return null;
+        return { ok: false };
       } finally {
         dispatch({ type: "pending", id, on: false });
       }
@@ -181,9 +210,28 @@ export function ProfileProvider({
   const ops = useMemo<ProfileOps>(() => {
     const pid = initial.id;
 
+    /** A profile envelope carries the profile alone; the blocks we hold are still ours. */
+    const withBlocks = (data: Parameters<typeof toProfile>[0], dims: CacheDimension[]): Profile => ({
+      ...toProfile(data, [], dims),
+      blocks: profileRef.current.blocks,
+    });
+
+    const reload = async () => {
+      try {
+        const fresh = await api.profile(pid);
+        versionRef.current = fresh.version;
+        conflictRef.current = false;
+        dispatch({ type: "loaded", profile: { ...fresh, blocks: [...fresh.blocks].sort(byRank) } });
+      } catch (err) {
+        if (err instanceof ApiError && err.isUnauthorized) {
+          window.location.href = "/login?error=expired";
+        }
+      }
+    };
+
     return {
       async updateProfileFields(patch) {
-        const previous = ref.current.profile;
+        const previous = profileRef.current;
         dispatch({
           type: "replace",
           profile: {
@@ -195,23 +243,31 @@ export function ProfileProvider({
         const res = await guard("profile", (version) =>
           api.updateProfile(pid, patch, { version }),
         );
-        if (!res) {
-          dispatch({ type: "replace", profile: previous });
+        if (!res.ok) {
+          dispatch({ type: "rollback", profile: previous });
           return;
         }
-        dispatch({ type: "replace", profile: res.data });
+        dispatch({
+          type: "replace",
+          profile: withBlocks(res.value.data, res.value.cacheDimensions),
+        });
+        applyVersion(res.value.version, res.value.cacheDimensions);
       },
 
       async claimHandle(handle) {
         const res = await guard("handle", (version) =>
           api.claimHandle(pid, handle, { version }),
         );
-        if (!res) return;
-        dispatch({ type: "replace", profile: res.data });
+        if (!res.ok) return;
+        dispatch({
+          type: "replace",
+          profile: withBlocks(res.value.data, res.value.cacheDimensions),
+        });
+        applyVersion(res.value.version, res.value.cacheDimensions);
       },
 
       async reorder(blockId, toIndex) {
-        const current = ref.current.profile.blocks;
+        const current = blocksRef.current;
         const from = current.findIndex((b) => b.id === blockId);
         if (from === -1 || from === toIndex) return;
 
@@ -234,7 +290,7 @@ export function ProfileProvider({
         next.splice(toIndex, 0, { ...moved, rank: optimistic });
         dispatch({ type: "blocks", blocks: next });
 
-        const result = await guard(blockId, (version) =>
+        const res = await guard(blockId, (version) =>
           api.moveBlock(
             pid,
             blockId,
@@ -243,104 +299,90 @@ export function ProfileProvider({
           ),
         );
 
-        if (!result) {
+        if (!res.ok) {
           dispatch({ type: "blocks", blocks: current });
           return;
         }
+        const placed = toBlock(res.value.data);
         dispatch({
           type: "blocks",
-          blocks: next
-            .map((b) => (b.id === blockId ? { ...b, rank: result.rank } : b))
-            .sort(byRank),
+          blocks: next.map((b) => (b.id === blockId ? placed : b)).sort(byRank),
         });
-        dispatch({
-          type: "apply",
-          version: result.version,
-          cacheDimensions: ref.current.profile.cacheDimensions,
-        });
+        applyVersion(res.value.version, res.value.cacheDimensions);
       },
 
       async createBlock(input) {
         const res = await guard("new", (version) => api.createBlock(pid, input, { version }));
-        if (!res) return;
-        dispatch({ type: "upsertBlock", block: res.data });
-        dispatch({ type: "apply", version: res.version, cacheDimensions: res.cacheDimensions });
+        if (!res.ok) return;
+        dispatch({ type: "upsertBlock", block: toBlock(res.value.data) });
+        applyVersion(res.value.version, res.value.cacheDimensions);
       },
 
       async updateBlock(blockId, patch) {
-        const previous = ref.current.profile.blocks.find((b) => b.id === blockId);
+        const previous = blocksRef.current.find((b) => b.id === blockId);
         if (previous) dispatch({ type: "upsertBlock", block: { ...previous, ...patch } });
 
         const res = await guard(blockId, (version) =>
           api.updateBlock(pid, blockId, patch, { version }),
         );
-        if (!res) {
+        if (!res.ok) {
           if (previous) dispatch({ type: "upsertBlock", block: previous });
           return;
         }
-        dispatch({ type: "upsertBlock", block: res.data });
-        dispatch({ type: "apply", version: res.version, cacheDimensions: res.cacheDimensions });
+        dispatch({ type: "upsertBlock", block: toBlock(res.value.data) });
+        applyVersion(res.value.version, res.value.cacheDimensions);
       },
 
       async deleteBlock(blockId) {
-        const previous = ref.current.profile.blocks;
+        const previous = blocksRef.current;
         dispatch({ type: "removeBlock", id: blockId });
         const res = await guard(blockId, (version) =>
           api.deleteBlock(pid, blockId, { version }),
         );
-        if (!res) {
+        if (!res.ok) {
           dispatch({ type: "blocks", blocks: previous });
           return;
         }
-        dispatch({ type: "apply", version: res.version, cacheDimensions: res.cacheDimensions });
+        // 204, so there is no envelope to read a version from — but the delete
+        // went through the same gate every write does and bumped it. Guessing
+        // +1 would be right until it wasn't, so re-read: the next write has to
+        // carry a version the server will accept.
+        await reload();
       },
 
-      async saveRule(rule) {
-        const { id, ...input } = rule;
-        const res = await guard(id ?? "new-rule", (version) =>
-          id
-            ? api.updateRule(pid, id, input, { version })
-            : api.createRule(pid, input, { version }),
+      async saveBlockRules(blockId, rules) {
+        const previous = blocksRef.current.find((b) => b.id === blockId);
+        if (previous) dispatch({ type: "upsertBlock", block: { ...previous, rules } });
+
+        const res = await guard(`${blockId}:rules`, (version) =>
+          api.saveBlockRules(pid, blockId, rules, { version }),
         );
-        if (!res) return null;
-        dispatch({ type: "upsertRule", rule: res.data });
-        dispatch({ type: "apply", version: res.version, cacheDimensions: res.cacheDimensions });
-        return res.data;
-      },
-
-      async deleteRule(ruleId) {
-        const previous = ref.current.profile;
-        dispatch({ type: "removeRule", id: ruleId });
-        const res = await guard(ruleId, (version) => api.deleteRule(pid, ruleId, { version }));
-        if (!res) {
-          dispatch({ type: "replace", profile: previous });
-          return;
+        if (!res.ok) {
+          if (previous) dispatch({ type: "upsertBlock", block: previous });
+          return false;
         }
-        dispatch({ type: "apply", version: res.version, cacheDimensions: res.cacheDimensions });
+        dispatch({ type: "upsertBlock", block: toBlock(res.value.data) });
+        applyVersion(res.value.version, res.value.cacheDimensions);
+        return true;
       },
 
       async publish() {
         const res = await guard("publish", (version) => api.publish(pid, { version }));
-        if (!res) return;
-        dispatch({ type: "replace", profile: res.data });
+        if (!res.ok) return;
+        dispatch({
+          type: "replace",
+          profile: withBlocks(res.value.data, res.value.cacheDimensions),
+        });
+        applyVersion(res.value.version, res.value.cacheDimensions);
       },
 
-      async reload() {
-        try {
-          const fresh = await api.profile(pid);
-          dispatch({ type: "replace", profile: { ...fresh, blocks: [...fresh.blocks].sort(byRank) } });
-        } catch (err) {
-          if (err instanceof ApiError && err.isUnauthorized) {
-            window.location.href = "/login?error=expired";
-          }
-        }
-      },
+      reload,
 
       dismissError() {
         dispatch({ type: "error", message: null });
       },
     };
-  }, [guard, initial.id]);
+  }, [applyVersion, guard, initial.id]);
 
   return <Ctx.Provider value={{ state, ops }}>{children}</Ctx.Provider>;
 }
@@ -351,14 +393,11 @@ export function useProfile() {
   return ctx;
 }
 
-export function useBlockRules(block: Block): Rule[] {
-  const { state } = useProfile();
-  return useMemo(
-    () =>
-      block.ruleIds
-        .map((id) => state.profile.rules.find((r) => r.id === id))
-        .filter((r): r is Rule => Boolean(r))
-        .sort((a, b) => a.priority - b.priority),
-    [block.ruleIds, state.profile.rules],
-  );
+/**
+ * A block's rules, in the order the evaluator runs them: lowest priority first,
+ * ties broken by id so two rules at the same priority cannot swap places
+ * between renders. `pick` in api/src/rules/rules.ts sorts exactly this way.
+ */
+export function orderedRules(rules: BlockRule[]): BlockRule[] {
+  return [...rules].sort((a, b) => a.priority - b.priority || (a.id < b.id ? -1 : 1));
 }

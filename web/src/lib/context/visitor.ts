@@ -13,6 +13,15 @@ import type { VisitorContext } from "@/lib/api/types";
 const COUNTRY = ["cloudfront-viewer-country", "x-vercel-ip-country", "x-country-code"];
 const REGION = ["cloudfront-viewer-country-region", "x-vercel-ip-country-region"];
 
+/**
+ * The in-app browsers the backend's mask can key on.
+ *
+ * Kept byte-identical to `WEBVIEW` in `api/edge/normalize.js` and `api/src/auth.ts`:
+ * the three implementations classify the same viewer, and a disagreement means
+ * a page cached under one answer is served to the other.
+ */
+const WEBVIEW = /Instagram|FBAV|FBAN|FB_IAB|TikTok|Line\/|MicroMessenger|Snapchat|Pinterest/i;
+
 export function visitorContextFromHeaders(h: Headers, now = new Date()): VisitorContext {
   const ua = h.get("user-agent") ?? "";
   return {
@@ -22,6 +31,11 @@ export function visitorContextFromHeaders(h: Headers, now = new Date()): Visitor
     os: osFromUserAgent(ua),
     referrerHost: refererHost(h.get("referer")),
     language: primaryLanguage(h.get("accept-language")),
+    // Omitting this made every profile with a webview rule permanently
+    // uncacheable: the backend's coverage check saw a dimension its rules need
+    // and nothing supplying it, so it answered `cacheable: false` and the page
+    // went out with `s-maxage=0` on every request.
+    webview: WEBVIEW.test(ua),
     at: now.toISOString(),
   };
 }
@@ -85,9 +99,31 @@ function primaryLanguage(accept: string | null): string | undefined {
  * a visitor waiting on a Lambda cold start.
  */
 export function cacheControlFor(sMaxAge: number): string {
-  const ceiling = Number(process.env.MAX_S_MAXAGE ?? 3600);
-  const s = Math.max(0, Math.min(Math.floor(sMaxAge), ceiling));
+  // Anything non-finite on either side used to travel all the way into the
+  // header as s-maxage=NaN. A malformed directive is dropped wholesale, so the
+  // page silently inherits the CDN default instead of the boundary we computed
+  // — the one failure here that never shows up as an error.
+  const bounded = Number.isFinite(sMaxAge) ? Math.min(Math.floor(sMaxAge), ceiling()) : 0;
+  const s = Math.max(0, bounded);
   if (s === 0) return "public, max-age=0, s-maxage=0, must-revalidate";
   const swr = Math.min(600, Math.max(30, Math.floor(s / 2)));
   return `public, max-age=0, s-maxage=${s}, stale-while-revalidate=${swr}`;
+}
+
+const DEFAULT_CEILING = 3600;
+let warnedAbout: string | null = null;
+
+/** MAX_S_MAXAGE in seconds, or the default when it is not a usable number. */
+function ceiling(): number {
+  const raw = process.env.MAX_S_MAXAGE;
+  if (raw === undefined || raw === "") return DEFAULT_CEILING;
+  const parsed = Number(raw);
+  if (Number.isFinite(parsed) && parsed > 0) return Math.floor(parsed);
+  if (warnedAbout !== raw) {
+    warnedAbout = raw;
+    console.warn(
+      `MAX_S_MAXAGE is "${raw}", not a number of seconds. Falling back to ${DEFAULT_CEILING}.`,
+    );
+  }
+  return DEFAULT_CEILING;
 }

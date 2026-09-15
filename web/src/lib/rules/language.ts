@@ -1,58 +1,93 @@
-import type {
-  CacheDimension,
-  Condition,
-  Dimension,
-  Rule,
-  RuleEffect,
-  TimeWindow,
-} from "@/lib/api/types";
+import type { CacheDimension, Dimension, TimeWindow } from "@/lib/api/types";
+import type { BlockRule, RuleAction, RuleCondition, RuleDimension, TimeCondition } from "./schema";
+
+/**
+ * How a rule reads in English.
+ *
+ * Conditions are worded the same way in the builder, on the block row and in
+ * the decision trace. Anything a creator sees twice should be worded the same
+ * both times, or they spend the difference working out whether it is the same
+ * thing.
+ */
 
 const DAY_NAMES = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"] as const;
 
-const DIMENSION_NOUNS: Record<Dimension, string> = {
-  country: "country",
-  region: "region",
-  device: "device",
-  os: "operating system",
-  referrer: "came from",
-  language: "language",
-  time: "time",
+/** The six geo buckets, as something other than a two-letter code. */
+export const GEO_LABELS: Record<string, string> = {
+  na: "North America",
+  eu: "Europe",
+  apac: "Asia-Pacific",
+  latam: "Latin America",
+  mea: "Middle East & Africa",
+  xx: "everywhere else",
+};
+
+/** The eight referrer codes. `dir` is "no referrer at all", not "some other site". */
+export const REFERRER_LABELS: Record<string, string> = {
+  ig: "Instagram",
+  tt: "TikTok",
+  li: "LinkedIn",
+  yt: "YouTube",
+  x: "X",
+  fb: "Facebook",
+  dir: "typed or tapped directly",
+  oth: "somewhere else",
+};
+
+export const RULE_DIMENSION_LABELS: Record<RuleDimension, string> = {
+  geo: "Region",
+  device: "Device",
+  referrer: "Came from",
+  lang: "Language",
+  webview: "In-app browser",
+  time: "Time",
 };
 
 /**
- * Conditions are rendered in the same vocabulary the decision trace uses, so
- * "device in [ios]" in the builder and in the trace read identically. Anything
- * a creator sees twice should be worded the same both times.
+ * The backend's dimension names onto the product's colour vocabulary.
+ *
+ * `DIMENSION_TONE` in components/ui/primitives.tsx is keyed on the older names,
+ * and it is the palette for the whole product — the chip in the builder, the
+ * rail segment on a block row and the line in the trace are one colour per kind
+ * of context. Mapping is cheaper than repainting.
  */
-export function describeCondition(c: Condition): string {
-  if (c.dimension === "time") {
-    return c.window ? describeWindow(c.window) : "time (not set)";
+export const TONE_DIMENSION: Record<RuleDimension, Dimension> = {
+  geo: "country",
+  device: "device",
+  referrer: "referrer",
+  lang: "language",
+  webview: "device",
+  time: "time",
+};
+
+export function describeCondition(c: RuleCondition): string {
+  switch (c.dim) {
+    case "geo":
+      return `in ${list(c.in.map((v) => GEO_LABELS[v] ?? v))}`;
+    case "device":
+      return `on ${list(c.in)}`;
+    case "referrer":
+      return `came from ${list(c.in.map((v) => REFERRER_LABELS[v] ?? v))}`;
+    case "lang":
+      return `speaks ${list(c.in.map((v) => v.toUpperCase()))}`;
+    case "webview":
+      return c.is ? "inside an in-app browser" : "not in an in-app browser";
+    case "time":
+      return describeTime(c);
   }
-  const values = (c.values ?? []).join(", ");
-  const noun = DIMENSION_NOUNS[c.dimension];
-  if (c.dimension === "referrer") {
-    return c.op === "not-in" ? `did not come from ${values}` : `came from ${values}`;
-  }
-  if (c.op === "not-in") return `${noun} is not ${values}`;
-  if (c.op === "matches") return `${noun} matches ${values}`;
-  return `${noun} is ${values}`;
 }
 
-export function describeWindow(w: TimeWindow): string {
+export function describeTime(c: TimeCondition): string {
   const days =
-    w.daysOfWeek.length === 0 || w.daysOfWeek.length === 7
+    !c.days || c.days.length === 0 || c.days.length === 7
       ? "every day"
-      : w.daysOfWeek
-          .slice()
-          .sort((a, b) => a - b)
-          .map((d) => DAY_NAMES[d] ?? "?")
-          .join(", ");
-  const crosses = crossesMidnight(w) ? " next day" : "";
-  return `${days} ${w.start}–${w.end}${crosses} in ${shortZone(w.timezone)}`;
+      : [...c.days].sort((a, b) => a - b).map((d) => DAY_NAMES[d] ?? "?").join(", ");
+  const crosses = crossesMidnight(c.from, c.to) ? " next day" : "";
+  return `${days} ${c.from}–${c.to}${crosses} in ${shortZone(c.tz)}`;
 }
 
-export function crossesMidnight(w: TimeWindow): boolean {
-  return toMinutes(w.end) <= toMinutes(w.start);
+export function crossesMidnight(from: string, to: string): boolean {
+  return toMinutes(to) <= toMinutes(from);
 }
 
 function toMinutes(hhmm: string): number {
@@ -65,80 +100,90 @@ export function shortZone(tz: string): string {
   return last.replace(/_/g, " ");
 }
 
-export function describeEffect(e: RuleEffect): string {
-  switch (e.type) {
-    case "show":
-      return "show it";
-    case "hide":
-      return "hide it";
-    case "rewrite":
-      return `send them to ${hostOf(e.url)}`;
-    case "promote":
-      return e.toIndex === 0 ? "move it to the top" : `move it to position ${e.toIndex + 1}`;
-  }
+export function describeAction(a: RuleAction): string {
+  return a.kind === "hide" ? "hide it" : `send them to ${hostOf(a.target)}`;
 }
 
-export function describeRule(rule: Rule): string {
-  const when = rule.conditions.map(describeCondition).join(" and ");
-  return `When ${when}, ${describeEffect(rule.effect)}.`;
+/**
+ * A rule with no conditions cannot be saved, so the "always" branch only ever
+ * shows on a draft that has not been submitted yet.
+ */
+export function describeRule(rule: BlockRule): string {
+  if (rule.when.length === 0) return `Always ${describeAction(rule.then)}.`;
+  return `When ${rule.when.map(describeCondition).join(" and ")}, ${describeAction(rule.then)}.`;
+}
+
+function list(values: string[]): string {
+  if (values.length <= 1) return values[0] ?? "nothing";
+  return `${values.slice(0, -1).join(", ")} or ${values[values.length - 1]}`;
 }
 
 function hostOf(url: string): string {
   try {
     return new URL(url).host;
   } catch {
-    return url;
+    return url || "nowhere yet";
   }
 }
 
 /**
+ * A time condition as `lib/rules/dst.ts` wants it.
+ *
+ * That module finds the DST gaps and repeats a window falls into, and it is
+ * owned elsewhere and takes the older `TimeWindow`. The two carry the same four
+ * facts under different names, so this is a rename rather than a conversion.
+ */
+export function toTimeWindow(c: TimeCondition): TimeWindow {
+  return { timezone: c.tz, daysOfWeek: c.days ?? [], start: c.from, end: c.to };
+}
+
+/* ═════════════════════════════════════════════════════════ cache estimate ══ */
+
+/**
  * Which cache-key dimensions a set of rules implies.
  *
- * The authoritative mask is derived server-side and published to the
- * KeyValueStore; treating it as a client-side optimisation would reintroduce
- * exactly the correctness gap the backend closes. This exists only so the
- * builder can warn "saving this adds `device` to your cache key" while the
- * creator is still editing, before a round trip. Always display
- * `profile.cacheDimensions` as the real value.
+ * The authoritative mask is derived server-side and comes back on every
+ * mutation as `cacheDimensions`; treating this as the real value would
+ * reintroduce exactly the correctness gap the backend closes. It exists only so
+ * the builder can say "saving this adds `device` to your cache key" while the
+ * creator is still editing, before a round trip.
+ *
+ * It speaks the backend's vocabulary, because there is only one vocabulary
+ * left: the saved shape is `BlockRule` and the pre-backend `Rule` is gone.
  */
-export function deriveCacheDimensions(rules: Rule[]): CacheDimension[] {
+export function deriveCacheDimensions(rules: BlockRule[]): CacheDimension[] {
   const out = new Set<CacheDimension>();
   for (const rule of rules) {
-    if (!rule.enabled) continue;
-    for (const c of rule.conditions) {
-      if (c.dimension === "time") {
-        // Time does not fragment by itself; the evaluator expresses it through
-        // s-maxage. It only enters the key when a window's zone differs from
-        // the page's own, which is bucketed rather than per-zone.
-        if (c.window && needsZoneBucket(c.window)) out.add("tz-bucket");
-        continue;
-      }
-      out.add(c.dimension as CacheDimension);
+    for (const c of rule.when) {
+      // A time window does not fragment the key — the evaluator expresses it
+      // through s-maxage — but it does bound the TTL, and the cost panel is
+      // about both. The backend reports it the same way.
+      out.add(c.dim);
     }
   }
   return [...out];
 }
 
-function needsZoneBucket(w: TimeWindow): boolean {
-  // A fixed-zone window is the same decision for every visitor, so it never
-  // fragments. "viewer" is the sentinel the backend uses for visitor-local
-  // windows, and those do.
-  return w.timezone === "viewer";
-}
-
 /** Cache-key cardinality, so "adds a dimension" has a number attached. */
-export function estimateVariants(rules: Rule[]): number {
+export function estimateVariants(rules: BlockRule[]): number {
   let total = 1;
   const seen = new Map<string, Set<string>>();
+
+  const note = (dimension: string, values: string[]) => {
+    const set = seen.get(dimension) ?? new Set<string>();
+    for (const v of values) set.add(v);
+    seen.set(dimension, set);
+  };
+
   for (const rule of rules) {
-    if (!rule.enabled) continue;
-    for (const c of rule.conditions) {
-      if (c.dimension === "time" || !c.values) continue;
-      const set = seen.get(c.dimension) ?? new Set<string>();
-      for (const v of c.values) set.add(v);
-      seen.set(c.dimension, set);
+    for (const c of rule.when) {
+      if (c.dim === "time") continue;
+      // A boolean splits traffic in two by itself; there is no third bucket
+      // to fall through to, which the +1 below would otherwise invent.
+      note(c.dim, c.dim === "webview" ? ["yes"] : c.in);
     }
   }
+
   for (const values of seen.values()) {
     // Each dimension splits traffic into its named values plus "everything else".
     total *= values.size + 1;

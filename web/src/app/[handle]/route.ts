@@ -3,7 +3,7 @@ import { api } from "@/lib/api/client";
 import { ApiError, type VisitorContext } from "@/lib/api/types";
 import { isReserved, isValidHandle } from "@/lib/handles";
 import { cacheControlFor, visitorContextFromHeaders } from "@/lib/context/visitor";
-import { renderProfile, varyHeader } from "@/lib/site/render";
+import { renderProfileDocument, varyHeader } from "@/lib/site/render";
 
 /**
  * GET /:handle — the public profile.
@@ -21,10 +21,14 @@ export async function GET(
   request: Request,
   { params }: { params: Promise<{ handle: string }> },
 ) {
-  const { handle } = await params;
+  const { handle: raw } = await params;
+  // Handles are lowercase by definition, so the normalised form is the handle;
+  // validating one spelling and resolving another is how a reserved or
+  // malformed handle gets through.
+  const handle = raw.toLowerCase();
 
   if (isReserved(handle)) return notFound();
-  if (!isValidHandle(handle.toLowerCase())) return notFound();
+  if (!isValidHandle(handle)) return notFound();
 
   const context = visitorContextFromHeaders(request.headers);
 
@@ -47,10 +51,10 @@ export async function GET(
   }
 
   const origin = process.env.NEXT_PUBLIC_SITE_ORIGIN ?? new URL(request.url).origin;
-  const html = renderProfile({
+  const page = renderProfileDocument({
     resolution,
     origin,
-    beaconUrl: process.env.NEXT_PUBLIC_BEACON_URL ?? "/v1/beacon",
+    beaconUrl: process.env.NEXT_PUBLIC_BEACON_URL ?? "/v1/events",
     variant: variantFingerprint(resolution.varyOn, context),
   });
 
@@ -59,14 +63,18 @@ export async function GET(
     "cache-control": cacheControlFor(resolution.sMaxAge),
     "x-content-type-options": "nosniff",
     "referrer-policy": "strict-origin-when-cross-origin",
-    // The inline style and script blocks are ours, not creator input; the
-    // hashes change per theme, so a nonce would defeat edge caching. Hashing
-    // the two literal blocks is the version to move to once the CSS is stable.
+    // The inline style and script blocks are ours, not creator input, and they
+    // are hashed rather than blessed with 'unsafe-inline': the theme changes
+    // the CSS per request, which rules out a static hash, and a nonce would
+    // vary per response and so defeat edge caching. The renderer hands back
+    // exactly what it inlined, so the hashes cannot drift from the bytes.
+    // The JSON-LD block is deliberately unhashed — it carries creator input,
+    // and a data-block <script> is never executed, so it is never blocked.
     "content-security-policy": [
       "default-src 'none'",
       "img-src https: data:",
-      "style-src 'unsafe-inline'",
-      "script-src 'unsafe-inline'",
+      `style-src '${sha256(page.style)}'`,
+      `script-src '${sha256(page.script)}'`,
       "connect-src https:",
       "form-action 'none'",
       "frame-ancestors 'self'",
@@ -79,7 +87,12 @@ export async function GET(
   const vary = varyHeader(resolution.varyOn);
   if (vary) headers.set("vary", vary);
 
-  return new Response(html, { status: 200, headers });
+  return new Response(page.html, { status: 200, headers });
+}
+
+/** A CSP hash-source for one inline block, over the exact bytes we emitted. */
+function sha256(source: string): string {
+  return `sha256-${createHash("sha256").update(source, "utf8").digest("base64")}`;
 }
 
 /**

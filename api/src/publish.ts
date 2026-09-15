@@ -74,3 +74,18 @@ export function maskDims(mask: string): Set<string> {
   const inv: Record<string, string> = { g: 'geo', d: 'device', r: 'referrer', l: 'lang', w: 'webview' };
   return new Set([...mask].map((ch) => inv[ch]).filter(Boolean));
 }
+
+/**
+ * The dimension names the editor displays, derived from the same blocks the
+ * mask is. This is the authoritative `cacheDimensions` every mutation returns;
+ * the client's own derivation exists only to warn about an unsaved edit.
+ *
+ * `time` is included when any rule has a time condition: a time window does not
+ * enter the cache key, but it does bound the TTL, and the cost panel is about
+ * both.
+ */
+export function cacheDimensionsFor(blocks: Block[]): string[] {
+  const dims = [...maskDims(deriveMask(blocks))];
+  const hasTime = blocks.some((b) => (b.rules ?? []).some((r) => r.when.some((c) => c.dim === 'time')));
+  return hasTime ? [...dims, 'time'] : dims;
+}

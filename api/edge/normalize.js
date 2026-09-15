@@ -37,6 +37,12 @@ function refClass(ref) {
 async function handler(event) {
   var req = event.request;
   var h = req.headers;
+
+  // Anything the viewer sent under this name is discarded before we look at the
+  // path. Every early return below would otherwise forward it to the origin,
+  // which trusts x-ctx as the normalized context it computed here.
+  delete req.headers['x-ctx'];
+
   var parts = req.uri.split('/');
   if (parts.length < 3) return req;
 
@@ -67,26 +73,45 @@ async function handler(event) {
     }
   } catch (e) {}
 
-  if (!mask) return req;
+  // Five fixed slots, always, in `gdrlw` order, with '-' for any dimension this
+  // profile's rules do not read.
+  //
+  // Emitting only the masked dimensions is what the first version did, and it
+  // was wrong: the origin decodes by position, so a mask of 'd' put the device
+  // token in the geo slot and the rule never matched — while the answer was
+  // still returned as cacheable and replayed to everyone sharing the key. Fixed
+  // slots cost four bytes and make the encoding self-describing.
+  //
+  // Cardinality is unaffected: an unmasked slot is the constant '-', so a
+  // profile with no rules has exactly one cache key per path.
+  var geo = '-';
+  var device = '-';
+  var referrer = '-';
+  var lang = '-';
+  var webview = '-';
 
-  var out = [];
   if (mask.indexOf('g') >= 0) {
     var c = h['cloudfront-viewer-country'] ? h['cloudfront-viewer-country'].value : '';
-    out.push(GEO[c] || 'xx');
+    geo = GEO[c] || 'xx';
   }
   if (mask.indexOf('d') >= 0) {
     var isTablet = h['cloudfront-is-tablet-viewer'] && h['cloudfront-is-tablet-viewer'].value === 'true';
     var isMobile = h['cloudfront-is-mobile-viewer'] && h['cloudfront-is-mobile-viewer'].value === 'true';
-    out.push(isTablet ? 't' : isMobile ? 'm' : 'd');
+    device = isTablet ? 't' : isMobile ? 'm' : 'd';
   }
-  if (mask.indexOf('r') >= 0) out.push(refClass(h.referer ? h.referer.value : ''));
+  if (mask.indexOf('r') >= 0) referrer = refClass(h.referer ? h.referer.value : '');
   if (mask.indexOf('l') >= 0) {
-    out.push((h['accept-language'] ? h['accept-language'].value : 'en').substring(0, 2).toLowerCase());
+    lang = (h['accept-language'] ? h['accept-language'].value : 'en').substring(0, 2).toLowerCase();
   }
   if (mask.indexOf('w') >= 0) {
-    out.push(WEBVIEW.test(h['user-agent'] ? h['user-agent'].value : '') ? '1' : '0');
+    webview = WEBVIEW.test(h['user-agent'] ? h['user-agent'].value : '') ? '1' : '0';
   }
 
-  req.headers['x-ctx'] = { value: 'v' + version + '|' + out.join('.') };
+  // Written unconditionally, including for maskless profiles. x-ctx is the sole
+  // header in the cache policy, so leaving a viewer-supplied one in place hands
+  // any client an unbounded supply of cache keys and an on-demand origin hit.
+  req.headers['x-ctx'] = {
+    value: 'v' + version + '|' + geo + '.' + device + '.' + referrer + '.' + lang + '.' + webview,
+  };
   return req;
 }

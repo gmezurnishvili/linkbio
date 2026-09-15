@@ -1,6 +1,7 @@
 import type { CacheDimension, Resolution, ResolvedBlock } from "@/lib/api/types";
 import { BASE_CSS, themeVariables } from "./theme";
 import { runtimeScript } from "./runtime";
+import { safeHref, safeUrl } from "./url";
 
 /**
  * The public profile is rendered to an HTML string rather than through React.
@@ -29,30 +30,51 @@ export interface RenderOptions {
   preview?: boolean;
 }
 
-export function renderProfile(opts: RenderOptions): string {
+export interface ProfileDocument {
+  html: string;
+  /** Exactly what sits between <style> and </style>. */
+  style: string;
+  /** Exactly what sits between <script> and </script>. */
+  script: string;
+}
+
+/**
+ * The page, plus the two inline blocks it embedded, byte for byte.
+ *
+ * The caller hashes those two strings into the CSP. Handing them back rather
+ * than letting the caller rebuild them is the whole point: a hash computed from
+ * a second, hopefully-identical copy of the CSS would silently stop matching
+ * the moment a theme variable changed, and the page would ship with its own
+ * styles blocked.
+ */
+export function renderProfileDocument(opts: RenderOptions): ProfileDocument {
   const { resolution, origin, beaconUrl, variant, preview } = opts;
   const p = resolution.profile;
   const canonical = `${origin}/${p.handle}`;
   const title = p.displayName || p.handle;
+  const image = safeUrl(p.avatarUrl);
 
-  return `<!DOCTYPE html>
+  const style = `:root{${themeVariables(p.theme)}}${BASE_CSS}`;
+  const script = runtimeScript(beaconUrl);
+
+  const html = `<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>${esc(title)}</title>
 <meta name="description" content="${esc(p.bio)}">
-<link rel="canonical" href="${esc(canonical)}">
+<link rel="canonical" href="${esc(safeHref(canonical))}">
 <meta property="og:type" content="profile">
 <meta property="og:title" content="${esc(title)}">
 <meta property="og:description" content="${esc(p.bio)}">
-<meta property="og:url" content="${esc(canonical)}">
-${p.avatarUrl ? `<meta property="og:image" content="${esc(p.avatarUrl)}">` : ""}
+<meta property="og:url" content="${esc(safeHref(canonical))}">
+${image ? `<meta property="og:image" content="${esc(image)}">` : ""}
 <meta name="twitter:card" content="summary">
 ${preview ? `<meta name="robots" content="noindex">` : ""}
-<style>:root{${themeVariables(p.theme)}}${BASE_CSS}</style>
+<style>${style}</style>
 <script type="application/ld+json">${jsonLd(opts)}</script>
-<link rel="alternate" type="application/ld+json" href="${esc(canonical)}/identity.json">
+<link rel="alternate" type="application/ld+json" href="${esc(safeHref(`${canonical}/identity.json`))}">
 </head>
 <body data-handle="${esc(p.handle)}"${variant ? ` data-variant="${esc(variant)}"` : ""}${preview ? ` data-preview="1"` : ""}>
 <main>
@@ -68,15 +90,23 @@ ${resolution.blocks.map((b) => block(b, p.handle)).join("\n")}
 ${resolution.blocks.length === 0 ? `<p class="note">Nothing here yet.</p>` : ""}
 <p class="foot">${esc(p.handle)}</p>
 </main>
-<script>${runtimeScript(beaconUrl)}</script>
+<script>${script}</script>
 </body>
 </html>`;
+
+  return { html, style, script };
+}
+
+/** The page on its own, for callers with no CSP to build (the simulator). */
+export function renderProfile(opts: RenderOptions): string {
+  return renderProfileDocument(opts).html;
 }
 
 function header({ resolution }: RenderOptions): string {
   const p = resolution.profile;
-  const avatar = p.avatarUrl
-    ? `<img class="avatar" src="${esc(p.avatarUrl)}" alt="" width="56" height="56" decoding="async">`
+  const image = safeUrl(p.avatarUrl);
+  const avatar = image
+    ? `<img class="avatar" src="${esc(image)}" alt="" width="56" height="56" decoding="async">`
     : `<div class="avatar" aria-hidden="true"></div>`;
   return `<div class="head">
   ${avatar}
@@ -106,7 +136,7 @@ function block(b: ResolvedBlock, handle: string): string {
     case "text":
       return `<p class="note">${esc(b.label)}</p>`;
     case "gate":
-      return `<a class="block" href="${esc(b.href ?? `/${handle}/l/${b.slug ?? b.id}`)}"
+      return `<a class="block" href="${esc(safeHref(b.href ?? `/${handle}/l/${b.slug ?? b.id}`))}"
   data-block="${esc(b.id)}"${b.slug ? ` data-slug="${esc(b.slug)}"` : ""}>
   <span class="tick" aria-hidden="true"></span>
   <span class="block-label">${esc(b.label)}${
@@ -122,10 +152,10 @@ function block(b: ResolvedBlock, handle: string): string {
 
 function linkBlock(b: ResolvedBlock, handle: string): string {
   const href = b.href ?? `/${handle}/l/${b.slug ?? b.id}`;
-  return `<a class="block" href="${esc(href)}"
+  return `<a class="block" href="${esc(safeHref(href))}"
   data-block="${esc(b.id)}"${b.slug ? ` data-slug="${esc(b.slug)}"` : ""}>
   <span class="block-label">${esc(b.label)}</span>
-  <span class="block-meta">${esc(destinationHint(b.href))}</span>
+  <span class="block-meta">${esc(destinationHint(b.target))}</span>
 </a>`;
 }
 
@@ -140,7 +170,7 @@ function feedBlock(b: ResolvedBlock): string {
         it.subtitle ? `<em>${esc(it.subtitle)}</em>` : ""
       }`;
       return it.href
-        ? `<a class="feed-item" href="${esc(it.href)}" data-block="${esc(b.id)}">${row}</a>`
+        ? `<a class="feed-item" href="${esc(safeHref(it.href))}" data-block="${esc(b.id)}">${row}</a>`
         : `<div class="feed-item">${row}</div>`;
     })
     .join("\n  ")}
@@ -151,6 +181,10 @@ function feedBlock(b: ResolvedBlock): string {
  * Visitors get told where a link actually goes. It is a courtesy on a page full
  * of opaque short links, and on a page whose destinations change by context it
  * is also the honest thing to show.
+ *
+ * It reads `target`, not `href`. `href` is the redirector — `/r/:handle/:id` —
+ * which `new URL()` rejects outright, so every hint on every page came back
+ * empty through the catch below and the line rendered blank.
  */
 function destinationHint(url: string | undefined): string {
   if (!url) return "";
@@ -170,15 +204,19 @@ export function jsonLd({ resolution, origin }: RenderOptions): string {
   const doc = {
     "@context": "https://schema.org",
     "@type": "Person",
-    "@id": `${origin}/${p.handle}#identity`,
+    "@id": safeUrl(`${origin}/${p.handle}#identity`),
     name: p.displayName || p.handle,
     alternateName: p.handle,
     description: p.bio || undefined,
-    image: p.avatarUrl || undefined,
-    url: `${origin}/${p.handle}`,
+    image: safeUrl(p.avatarUrl),
+    url: safeUrl(`${origin}/${p.handle}`),
+    // An agent reading this document will follow what it finds here, so the
+    // same scheme rule applies as in the markup. A rejected URL is dropped
+    // rather than replaced: "#" would be worse than saying nothing.
     sameAs: resolution.blocks
-      .filter((b) => b.kind === "link" && b.href)
-      .map((b) => b.href!)
+      .filter((b) => b.kind === "link")
+      .map((b) => safeUrl(b.href))
+      .filter((href): href is string => href !== undefined)
       .slice(0, 25),
     subjectOf: resolution.blocks
       .filter((b) => b.kind === "feed" && b.items?.length)
@@ -187,7 +225,7 @@ export function jsonLd({ resolution, origin }: RenderOptions): string {
           "@type": "Event",
           name: it.title,
           description: it.subtitle || undefined,
-          url: it.href || undefined,
+          url: safeUrl(it.href),
         })),
       ),
   };
@@ -201,20 +239,56 @@ function dropEmpty(_key: string, value: unknown) {
   return value;
 }
 
+/**
+ * Which request headers a resolution's dimensions correspond to.
+ *
+ * `null` is a dimension that genuinely varies nothing the viewer sent, and is
+ * spelled out so it is skipped on purpose rather than by omission. Absent is an
+ * unknown dimension, which varyHeader refuses to guess at.
+ */
+const VIEWER_HEADER: Record<string, string | null> = {
+  // The backend's vocabulary — `cacheDimensionsFor` in api/src/publish.ts. Geo
+  // reaches the origin as a country and is bucketed at the edge, so the header
+  // that varies is still the country one.
+  geo: "CloudFront-Viewer-Country",
+  device: "CloudFront-Is-Mobile-Viewer, CloudFront-Is-Tablet-Viewer",
+  referrer: "Referer",
+  lang: "Accept-Language",
+  webview: "User-Agent",
+  // A time window bounds the TTL instead of splitting the key: two visitors at
+  // the same instant get the same page, and s-maxage is what expires it.
+  time: null,
+
+  // The display-side estimate's older names, which still reach here from a
+  // profile whose mask was computed before the backend owned it.
+  country: "CloudFront-Viewer-Country",
+  region: "CloudFront-Viewer-Country-Region",
+  os: "User-Agent",
+  language: "Accept-Language",
+  "tz-bucket": null,
+};
+
 export function varyHeader(dimensions: CacheDimension[]): string | null {
   // CloudFront builds the real cache key from the KeyValueStore mask; this
   // header is for any intermediary between the viewer and the distribution,
   // and for humans reading curl output.
-  const map: Partial<Record<CacheDimension, string>> = {
-    country: "CloudFront-Viewer-Country",
-    region: "CloudFront-Viewer-Country-Region",
-    device: "CloudFront-Is-Mobile-Viewer",
-    os: "User-Agent",
-    referrer: "Referer",
-    language: "Accept-Language",
-  };
-  const names = dimensions.map((d) => map[d]).filter(Boolean) as string[];
-  return names.length ? names.join(", ") : null;
+  const names = new Set<string>();
+  for (const d of dimensions) {
+    const header = VIEWER_HEADER[d];
+    if (header === null) continue;
+    if (header === undefined) {
+      // The old `.filter(Boolean)` swallowed exactly this case, and geo, lang
+      // and webview — every dimension the backend actually reports — vanished
+      // from the header without a single sign of it. A dimension we cannot
+      // express is a page that varies on something a shared cache cannot see,
+      // so say so and take the hit: a cold cache is visible, one visitor's page
+      // served to another is not.
+      console.warn(`varyHeader: no viewer header known for cache dimension "${d}"`);
+      return "*";
+    }
+    names.add(header);
+  }
+  return names.size ? [...names].join(", ") : null;
 }
 
 export function esc(value: string | undefined | null): string {

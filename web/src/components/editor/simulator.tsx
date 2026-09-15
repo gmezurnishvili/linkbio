@@ -3,8 +3,11 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { api } from "@/lib/api/client";
 import type { Resolution, VisitorContext } from "@/lib/api/types";
+import { toLocalInput } from "@/lib/datetime";
 import { renderProfile } from "@/lib/site/render";
-import { Chip, Select, cx } from "@/components/ui/primitives";
+import { GEO_LABELS, REFERRER_LABELS } from "@/lib/rules/language";
+import { DEVICES, GEO_BUCKETS, REFERRERS } from "@/lib/rules/schema";
+import { Chip, Select, Toggle, cx } from "@/components/ui/primitives";
 import { useProfile } from "./profile-store";
 
 /**
@@ -21,47 +24,66 @@ import { useProfile } from "./profile-store";
  * s-maxage it computed and the next instant the answer changes.
  */
 
-const COUNTRIES = [
-  ["", "Anywhere"],
-  ["US", "United States"],
-  ["CA", "Canada"],
-  ["GB", "United Kingdom"],
-  ["DE", "Germany"],
-  ["GE", "Georgia"],
-  ["BR", "Brazil"],
-  ["JP", "Japan"],
-  ["NG", "Nigeria"],
-  ["AU", "Australia"],
-] as const;
+/**
+ * Every control here is a dimension the evaluator can actually tell apart.
+ *
+ * It used to offer nine countries and an os — "iPhone · Safari" against
+ * "Android · Chrome" — and neither survived the trip: the adapter folds a
+ * country into one of six buckets and drops os outright, so picking iOS moved
+ * nothing on screen. A control that changes nothing is worse than a missing
+ * one, because it teaches a creator that their rule does not work.
+ *
+ * The lists come from lib/rules/schema.ts, which mirrors the backend's enums,
+ * and the words from lib/rules/language.ts, so a bucket is named the same here
+ * as it is in the rule that selects it.
+ *
+ * `ANY` is the empty option every picker carries: a visitor the edge could not
+ * classify, which is a real visitor and not the same as any of the values.
+ */
+const ANY = "";
 
-const CLIENTS: { label: string; ctx: Partial<VisitorContext> }[] = [
-  { label: "iPhone · Safari", ctx: { device: "mobile", os: "ios" } },
-  { label: "iPhone · Instagram", ctx: { device: "mobile", os: "ios", referrerHost: "instagram.com" } },
-  { label: "Android · Chrome", ctx: { device: "mobile", os: "android" } },
-  { label: "Android · TikTok", ctx: { device: "mobile", os: "android", referrerHost: "tiktok.com" } },
-  { label: "iPad", ctx: { device: "tablet", os: "ios" } },
-  { label: "Mac · desktop", ctx: { device: "desktop", os: "macos" } },
-];
+type Geo = NonNullable<VisitorContext["geo"]>;
+type Device = NonNullable<VisitorContext["device"]>;
+type Referrer = NonNullable<VisitorContext["referrer"]>;
+
+/** Enough to exercise a `lang` rule; the wire wants a two-letter code. */
+const LANGUAGES = [
+  ["en", "English"],
+  ["es", "Spanish"],
+  ["pt", "Portuguese"],
+  ["fr", "French"],
+  ["de", "German"],
+  ["ja", "Japanese"],
+  ["ar", "Arabic"],
+] as const;
 
 export function Simulator() {
   const { state } = useProfile();
-  const [clientIndex, setClientIndex] = useState(0);
-  const [country, setCountry] = useState("");
+  const [geo, setGeo] = useState<Geo | typeof ANY>(ANY);
+  const [device, setDevice] = useState<Device | typeof ANY>(ANY);
+  const [referrer, setReferrer] = useState<Referrer | typeof ANY>(ANY);
+  const [language, setLanguage] = useState<string>("en");
+  const [webview, setWebview] = useState(false);
   const [at, setAt] = useState(() => toLocalInput(new Date()));
   const [resolution, setResolution] = useState<Resolution | null>(null);
   const [status, setStatus] = useState<"idle" | "loading" | "error">("idle");
   const seq = useRef(0);
 
   const context = useMemo<VisitorContext>(() => {
-    const client = CLIENTS[clientIndex] ?? CLIENTS[0]!;
     const instant = new Date(at);
     return {
-      ...client.ctx,
-      country: country || undefined,
-      language: "en",
+      // The coarse values directly: these are the ones the edge would have
+      // computed, and `toWireContext` passes them straight through. "Anywhere"
+      // is absent rather than a bucket, which is how a visitor whose country
+      // header never arrived reaches the evaluator.
+      geo: geo || undefined,
+      device: device || undefined,
+      referrer: referrer || undefined,
+      language: language || undefined,
+      webview,
       at: (Number.isNaN(instant.getTime()) ? new Date() : instant).toISOString(),
     };
-  }, [clientIndex, country, at]);
+  }, [geo, device, referrer, language, webview, at]);
 
   // Re-resolve on any context change and after any mutation — the profile
   // version is in the dependency list precisely so an edit refreshes the frame.
@@ -100,26 +122,50 @@ export function Simulator() {
       <h2 className="text-[0.8125rem] text-muted">Simulate a visitor</h2>
 
       <div className="flex flex-col gap-2">
-        <Select
-          aria-label="Country"
-          value={country}
-          onChange={(e) => setCountry(e.target.value)}
-        >
-          {COUNTRIES.map(([code, name]) => (
-            <option key={code} value={code}>
-              {name}
+        <Select aria-label="Region" value={geo} onChange={(e) => setGeo(e.target.value as Geo)}>
+          <option value={ANY}>Anywhere</option>
+          {GEO_BUCKETS.map((b) => (
+            <option key={b} value={b}>
+              {GEO_LABELS[b] ?? b}
             </option>
           ))}
         </Select>
 
         <Select
-          aria-label="Client"
-          value={clientIndex}
-          onChange={(e) => setClientIndex(Number(e.target.value))}
+          aria-label="Device"
+          value={device}
+          onChange={(e) => setDevice(e.target.value as Device)}
         >
-          {CLIENTS.map((c, i) => (
-            <option key={c.label} value={i}>
-              {c.label}
+          <option value={ANY}>Any device</option>
+          {DEVICES.map((d) => (
+            <option key={d} value={d}>
+              {d}
+            </option>
+          ))}
+        </Select>
+
+        <Select
+          aria-label="Came from"
+          value={referrer}
+          onChange={(e) => setReferrer(e.target.value as Referrer)}
+        >
+          <option value={ANY}>Any source</option>
+          {REFERRERS.map((r) => (
+            <option key={r} value={r}>
+              {REFERRER_LABELS[r] ?? r}
+            </option>
+          ))}
+        </Select>
+
+        <Select
+          aria-label="Language"
+          value={language}
+          onChange={(e) => setLanguage(e.target.value)}
+        >
+          <option value={ANY}>Any language</option>
+          {LANGUAGES.map(([code, name]) => (
+            <option key={code} value={code}>
+              {name}
             </option>
           ))}
         </Select>
@@ -130,6 +176,13 @@ export function Simulator() {
           value={at}
           onChange={(e) => setAt(e.target.value)}
           className="tnum h-9 w-full rounded-desk border border-line bg-panel px-2.5 text-sm outline-none focus:border-geo"
+        />
+
+        <Toggle
+          checked={webview}
+          onChange={setWebview}
+          label="In-app browser"
+          description="Opened inside Instagram or TikTok rather than in Safari or Chrome."
         />
       </div>
 
@@ -215,12 +268,4 @@ function formatTtl(seconds: number): string {
   if (seconds < 90) return `${seconds}s`;
   if (seconds < 5400) return `${Math.round(seconds / 60)}m`;
   return `${(seconds / 3600).toFixed(1)}h`;
-}
-
-/** datetime-local wants local wall time with no zone suffix. */
-function toLocalInput(date: Date): string {
-  const pad = (n: number) => String(n).padStart(2, "0");
-  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(
-    date.getHours(),
-  )}:${pad(date.getMinutes())}`;
 }

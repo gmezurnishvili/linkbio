@@ -2,24 +2,41 @@ import { test, describe, before } from 'node:test';
 import assert from 'node:assert/strict';
 import { SignJWT } from 'jose';
 
-process.env.DEV_JWT_SECRET = 'test-secret-value-at-least-32-bytes-long!!';
+// `src/env.ts` parses process.env at module load and throws on a bad value, so
+// the configuration has to be in place before anything under src/ is imported.
+// A secret shorter than 32 bytes, or a missing one, stops the process.
+process.env.AUTH_SECRET = 'test-secret-value-at-least-32-bytes-long!!';
 process.env.DB_DRIVER = 'memory';
+process.env.NODE_ENV = 'test';
 
 const { createApp } = await import('../src/app.ts');
 const { MemoryRepo } = await import('../src/db/memory.ts');
-const { rankBetween, initialRanks } = await import('../src/rank.ts');
+const { SELF_AUDIENCE, SELF_ISSUER } = await import('../src/auth.ts');
 const { deriveMask } = await import('../src/publish.ts');
 
 let app: ReturnType<typeof createApp>;
 let token: string;
 let otherToken: string;
 
-async function sign(sub: string) {
-  return new SignJWT({ scope: 'profiles:write' })
+const secret = () => new TextEncoder().encode(process.env.AUTH_SECRET!);
+
+/**
+ * A token shaped like the ones `routes/auth.ts` mints.
+ *
+ * `requireAuth` pins HS256, requires `exp` and `sub`, checks issuer and
+ * audience, and refuses a token whose `typ` is present and not `'access'` — so
+ * a refresh token cannot be replayed as an access token. Every one of those is
+ * load-bearing, which is why this helper sets all of them.
+ */
+async function sign(sub: string, over: Record<string, unknown> = {}) {
+  let jwt = new SignJWT({ typ: 'access', scope: 'profiles:write', ...over })
     .setProtectedHeader({ alg: 'HS256' })
     .setSubject(sub)
-    .setExpirationTime('1h')
-    .sign(new TextEncoder().encode(process.env.DEV_JWT_SECRET!));
+    .setIssuer(SELF_ISSUER)
+    .setAudience(SELF_AUDIENCE)
+    .setIssuedAt();
+  if (!('noExp' in over)) jwt = jwt.setExpirationTime('1h');
+  return jwt.sign(secret());
 }
 
 function req(path: string, init: RequestInit = {}, auth?: string) {
@@ -37,35 +54,8 @@ before(async () => {
   otherToken = await sign('user_bob');
 });
 
-// ---------------------------------------------------------------- rank
-
-describe('fractional ranking', () => {
-  test('midpoint lands strictly between neighbours', () => {
-    const a = rankBetween(null, null);
-    const b = rankBetween(a, null);
-    const mid = rankBetween(a, b);
-    assert.ok(a < mid && mid < b, `${a} < ${mid} < ${b}`);
-  });
-
-  test('survives repeated subdivision at the same spot', () => {
-    let lo = rankBetween(null, null);
-    const hi = rankBetween(lo, null);
-    for (let i = 0; i < 200; i++) {
-      const next = rankBetween(lo, hi);
-      assert.ok(lo < next && next < hi, `iteration ${i}: ${lo} < ${next} < ${hi}`);
-      lo = next;
-    }
-  });
-
-  test('initial ranks are ascending', () => {
-    const r = initialRanks(10);
-    assert.deepEqual(r, [...r].sort());
-  });
-
-  test('rejects inverted bounds', () => {
-    assert.throws(() => rankBetween('b', 'a'), RangeError);
-  });
-});
+// The fractional-indexing unit tests moved to test/rank.test.ts, which covers
+// the same cases plus the seams the rewrite of `rankBetween` exists to fix.
 
 // ---------------------------------------------------------------- auth
 
@@ -85,6 +75,50 @@ describe('auth', () => {
     const r = await req('/v1/profiles', {}, token);
     assert.equal(r.status, 200);
   });
+
+  test('rejects a token signed with another key', async () => {
+    const forged = await new SignJWT({ typ: 'access' })
+      .setProtectedHeader({ alg: 'HS256' })
+      .setSubject('user_alice')
+      .setIssuer(SELF_ISSUER)
+      .setAudience(SELF_AUDIENCE)
+      .setExpirationTime('1h')
+      .sign(new TextEncoder().encode('a-completely-different-secret-value-32!!'));
+    assert.equal((await req('/v1/profiles', {}, forged)).status, 401);
+  });
+
+  // A refresh token is signed with the same key as an access token. Without the
+  // `typ` check it could be replayed here and would carry the refresh token's
+  // much longer lifetime into the control plane.
+  test('rejects a token whose typ is not access', async () => {
+    const refreshish = await sign('user_alice', { typ: 'refresh' });
+    assert.equal((await req('/v1/profiles', {}, refreshish)).status, 401);
+  });
+
+  test('rejects a token with no expiry', async () => {
+    const forever = await sign('user_alice', { noExp: true });
+    assert.equal((await req('/v1/profiles', {}, forever)).status, 401);
+  });
+
+  test('rejects a token minted for another audience', async () => {
+    const wrong = await new SignJWT({ typ: 'access' })
+      .setProtectedHeader({ alg: 'HS256' })
+      .setSubject('user_alice')
+      .setIssuer(SELF_ISSUER)
+      .setAudience('some-other-app')
+      .setExpirationTime('1h')
+      .sign(secret());
+    assert.equal((await req('/v1/profiles', {}, wrong)).status, 401);
+  });
+
+  test('an unmatched route is problem+json too', async () => {
+    const r = await req('/v1/definitely-not-a-route');
+    assert.equal(r.status, 404);
+    assert.equal(r.headers.get('content-type'), 'application/problem+json');
+    const body = await r.json() as any;
+    assert.equal(body.title, 'not_found');
+    assert.ok(body.requestId, 'error bodies carry the request id');
+  });
 });
 
 // ---------------------------------------------------------------- profiles
@@ -93,14 +127,20 @@ describe('profiles', () => {
   test('creates a profile and claims the handle', async () => {
     const r = await req('/v1/profiles', json({ handle: 'alice', title: 'Alice' }), token);
     assert.equal(r.status, 201);
-    const p = await r.json() as any;
-    assert.equal(p.handle, 'alice');
-    assert.equal(p.version, 1);
+    // Mutations answer with an envelope, not the bare entity.
+    const body = await r.json() as any;
+    assert.equal(body.data.handle, 'alice');
+    assert.equal(body.data.version, 1);
+    assert.equal(body.version, 1);
+    assert.deepEqual(body.cacheDimensions, []);
+    // A page nobody has published yet is a draft, not an empty page.
+    assert.equal(body.data.publishedVersion, null);
   });
 
   test('a second claim on the same handle conflicts', async () => {
     const r = await req('/v1/profiles', json({ handle: 'alice', title: 'Impostor' }), otherToken);
     assert.equal(r.status, 409);
+    assert.equal((await r.json() as any).title, 'conflict');
   });
 
   test('rejects reserved handles', async () => {
@@ -122,17 +162,36 @@ describe('profiles', () => {
     assert.equal(r.status, 403);
   });
 
-  test('renaming frees the old handle', async () => {
+  /**
+   * A rename holds the old handle against everyone else for 90 days.
+   *
+   * This test used to assert that a *different* user could immediately reclaim
+   * it, which was the opposite of what production did — MemoryRepo freed the
+   * handle while DynamoRepo tombstoned it, and the suite certified the wrong
+   * one. Both repos tombstone now; `test/conformance.test.ts` holds them to it.
+   */
+  test('renaming tombstones the old handle against everyone else', async () => {
     const list = await (await req('/v1/profiles', {}, token)).json() as any;
     const id = list.profiles[0].id;
     const r = await req(`/v1/profiles/${id}/handle`, {
       method: 'PUT', body: JSON.stringify({ handle: 'alicia' }),
     }, token);
     assert.equal(r.status, 200);
-    assert.equal((await r.json() as any).handle, 'alicia');
+    assert.equal((await r.json() as any).data.handle, 'alicia');
 
-    const reclaim = await req('/v1/profiles', json({ handle: 'alice', title: 'Bob' }), otherToken);
-    assert.equal(reclaim.status, 201);
+    const avail = await req('/v1/handles/alice');
+    assert.deepEqual(await avail.json(), { available: false, reason: 'tombstoned' });
+
+    const steal = await req('/v1/profiles', json({ handle: 'alice', title: 'Bob' }), otherToken);
+    assert.equal(steal.status, 409);
+  });
+
+  test('the profile that gave a handle up can take it back', async () => {
+    const list = await (await req('/v1/profiles', {}, token)).json() as any;
+    const id = list.profiles[0].id;
+    const r = await req(`/v1/profiles/${id}/handle`, json({ handle: 'alice' }), token);
+    assert.equal(r.status, 200);
+    assert.equal((await r.json() as any).data.handle, 'alice');
   });
 });
 
@@ -143,7 +202,7 @@ describe('blocks', () => {
 
   before(async () => {
     const r = await req('/v1/profiles', json({ handle: 'carol', title: 'Carol' }), token);
-    pid = (await r.json() as any).id;
+    pid = (await r.json() as any).data.id;
   });
 
   const mkBlock = (label: string, target: string) =>
@@ -153,9 +212,28 @@ describe('blocks', () => {
     for (const n of ['one', 'two', 'three']) {
       const r = await mkBlock(n, `https://example.com/${n}`);
       assert.equal(r.status, 201);
+      const body = await r.json() as any;
+      assert.equal(body.data.label, n);
+      assert.ok(Number.isInteger(body.version), 'the envelope carries the new profile version');
     }
     const { blocks } = await (await req(`/v1/profiles/${pid}/blocks`, {}, token)).json() as any;
     assert.deepEqual(blocks.map((b: { label: string }) => b.label), ['one', 'two', 'three']);
+  });
+
+  test('every block write bumps the profile version', async () => {
+    const before = (await (await req(`/v1/profiles/${pid}`, {}, token)).json() as any).version;
+    const r = await mkBlock('four', 'https://example.com/four');
+    assert.equal((await r.json() as any).version, before + 1);
+  });
+
+  // The blocks router is mounted as a child of `profiles`, so the ownership
+  // middleware has to reach it — if it did not, `c.get('profile')` would be
+  // whatever the last request left behind.
+  test('another user cannot read or write the blocks', async () => {
+    assert.equal((await req(`/v1/profiles/${pid}/blocks`, {}, otherToken)).status, 403);
+    const write = await req(`/v1/profiles/${pid}/blocks`,
+      json({ label: 'theirs', target: 'https://theirs.example' }), otherToken);
+    assert.equal(write.status, 403);
   });
 
   test('rejects a private-network target', async () => {
@@ -177,7 +255,10 @@ describe('blocks', () => {
     assert.equal(r.status, 200);
 
     const after = await (await req(`/v1/profiles/${pid}/blocks`, {}, token)).json() as any;
-    assert.deepEqual(after.blocks.map((b: { label: string }) => b.label), ['three', 'one', 'two']);
+    assert.deepEqual(
+      after.blocks.slice(0, 3).map((b: { label: string }) => b.label),
+      ['three', 'one', 'two'],
+    );
 
     // Only the moved row changed rank.
     const changed = after.blocks.filter((b: { id: string; rank: string }) =>
@@ -197,6 +278,7 @@ describe('blocks', () => {
   test('deletes a block', async () => {
     const { blocks } = await (await req(`/v1/profiles/${pid}/blocks`, {}, token)).json() as any;
     const r = await req(`/v1/profiles/${pid}/blocks/${blocks[0].id}`, { method: 'DELETE' }, token);
+    // DELETE stays a bare 204 — there is no entity left to wrap.
     assert.equal(r.status, 204);
     const after = await (await req(`/v1/profiles/${pid}/blocks`, {}, token)).json() as any;
     assert.equal(after.blocks.length, blocks.length - 1);
@@ -211,10 +293,10 @@ describe('rules and edge mask', () => {
 
   before(async () => {
     const r = await req('/v1/profiles', json({ handle: 'dave', title: 'Dave' }), token);
-    pid = (await r.json() as any).id;
+    pid = (await r.json() as any).data.id;
     const b = await req(`/v1/profiles/${pid}/blocks`,
       json({ label: 'store', target: 'https://store.example' }), token);
-    blockId = (await b.json() as any).id;
+    blockId = (await b.json() as any).data.id;
   });
 
   test('mask is empty with no rules', () => {
@@ -231,6 +313,8 @@ describe('rules and edge mask', () => {
       }]),
     }, token);
     assert.equal(r.status, 200);
+    // The envelope reports the mask the edge will now key on.
+    assert.deepEqual((await r.json() as any).cacheDimensions, ['geo']);
   });
 
   test('rejects duplicate conditions on one dimension', async () => {
@@ -278,10 +362,14 @@ describe('public resolve', () => {
 
   before(async () => {
     const r = await req('/v1/profiles', json({ handle: 'erin', title: 'Erin' }), token);
-    pid = (await r.json() as any).id;
+    pid = (await r.json() as any).data.id;
     const b = await req(`/v1/profiles/${pid}/blocks`,
       json({ label: 'shop', target: 'https://shop.example' }), token);
-    blockId = (await b.json() as any).id;
+    blockId = (await b.json() as any).data.id;
+    // The public routes 404 until the page is published. `publishedVersion`
+    // survives every later edit, so this only has to happen once.
+    const pub = await req(`/v1/profiles/${pid}/publish`, { method: 'POST' }, token);
+    assert.equal(pub.status, 200);
   });
 
   test('redirects to the default target', async () => {
@@ -318,8 +406,23 @@ describe('public resolve', () => {
     assert.equal(us.headers.get('location'), 'https://shop.example');
   });
 
+  /**
+   * The geo slot is the first of the five, and the mask here covers geo — so an
+   * `x-ctx` that carries a geo token is complete for this block. What makes the
+   * answer uncacheable is only that the edge keyed it under an older version.
+   */
   test('a stale edge mask version forces no-store', async () => {
     const r = await req(`/r/erin/${blockId}`, { headers: { 'x-ctx': 'v1|eu.d.dir.en.0' } });
+    assert.equal(r.headers.get('cache-control'), 'no-store');
+    assert.equal(r.headers.get('location'), 'https://shop.example/eu');
+  });
+
+  // The edge only sends the dimensions the profile's mask covers. A mask that
+  // does not cover geo cannot produce a cacheable answer for a geo rule, and
+  // the coverage check has to notice from the `x-ctx` alone.
+  test('an x-ctx missing the dimension a rule needs forces no-store', async () => {
+    const version = (await (await req(`/v1/profiles/${pid}`, {}, token)).json() as any).version;
+    const r = await req(`/r/erin/${blockId}`, { headers: { 'x-ctx': `v${version}|-.m.-.-.-` } });
     assert.equal(r.headers.get('cache-control'), 'no-store');
   });
 
@@ -327,7 +430,7 @@ describe('public resolve', () => {
     const soon = Date.now() + 120_000;
     const b = await req(`/v1/profiles/${pid}/blocks`,
       json({ label: 'drop', target: 'https://drop.example', activeFrom: soon }), token);
-    const id = (await b.json() as any).id;
+    const id = (await b.json() as any).data.id;
 
     const r = await req(`/r/erin/${id}`);
     assert.equal(r.status, 404);
@@ -347,6 +450,7 @@ describe('public resolve', () => {
     assert.equal(r.status, 200);
     const body = await r.json() as any;
     assert.ok(!body.blocks.some((b: { label: string }) => b.label === 'secret'));
+    assert.equal(body.published, true);
   });
 });
 
@@ -354,26 +458,57 @@ describe('public resolve', () => {
 
 describe('analytics', () => {
   let pid: string;
+  let blockId: string;
 
   before(async () => {
     const r = await req('/v1/profiles', json({ handle: 'frank', title: 'Frank' }), token);
-    pid = (await r.json() as any).id;
+    pid = (await r.json() as any).data.id;
+    const b = await req(`/v1/profiles/${pid}/blocks`,
+      json({ label: 'link', target: 'https://frank.example' }), token);
+    blockId = (await b.json() as any).data.id;
   });
+
+  const stats = async () =>
+    await (await req(`/v1/profiles/${pid}/analytics`, {}, token)).json() as any;
 
   test('accepts a beacon batch without auth', async () => {
     const r = await req('/v1/events', json({
-      events: [{ handle: 'frank', blockId: 'blk_1', ts: Date.now() }],
+      events: [{ handle: 'frank', blockId, ts: Date.now() }],
     }));
     assert.equal(r.status, 202);
+    const body = await stats();
+    assert.equal(body.totals.clicks, 1);
+    assert.equal(body.byBlock[blockId], 1);
+  });
+
+  // An id the caller made up used to land in the owner's analytics, where on
+  // DynamoDB it also accumulated toward the item size limit.
+  test('silently drops events for a block that is not on the profile', async () => {
+    const before = await stats();
+    const r = await req('/v1/events', json({
+      events: [{ handle: 'frank', blockId: 'blk_not_mine', ts: Date.now() }],
+    }));
+    assert.equal(r.status, 202);
+    const after = await stats();
+    assert.equal(after.totals.clicks, before.totals.clicks);
+    assert.equal(after.byBlock.blk_not_mine, undefined);
+  });
+
+  test('an event with no blockId counts as a view', async () => {
+    const before = await stats();
+    await req('/v1/events', json({ events: [{ handle: 'frank', ts: Date.now() }] }));
+    const after = await stats();
+    assert.equal(after.totals.views, before.totals.views + 1);
+    assert.equal(after.totals.clicks, before.totals.clicks);
   });
 
   test('clamps an out-of-range timestamp into today', async () => {
     await req('/v1/events', json({
-      events: [{ handle: 'frank', blockId: 'blk_2', ts: 1 }],
+      events: [{ handle: 'frank', blockId, ts: 1 }],
     }));
-    const r = await req(`/v1/profiles/${pid}/analytics`, {}, token);
-    const body = await r.json() as any;
+    const body = await stats();
     const today = new Date().toISOString().slice(0, 10);
+    assert.ok(body.daily.length > 0);
     assert.ok(body.daily.every((d: { date: string }) => d.date === today));
   });
 
@@ -382,6 +517,19 @@ describe('analytics', () => {
       events: Array.from({ length: 51 }, () => ({ handle: 'frank', ts: Date.now() })),
     }));
     assert.equal(r.status, 400);
+  });
+
+  // The daily rollup and the all-time totals are assembled from different rows;
+  // they have to agree.
+  test('daily byBlock sums to the all-time block totals', async () => {
+    const body = await stats();
+    const summed: Record<string, number> = {};
+    for (const d of body.daily) {
+      for (const [id, n] of Object.entries(d.byBlock as Record<string, number>)) {
+        summed[id] = (summed[id] ?? 0) + n;
+      }
+    }
+    assert.deepEqual(summed, body.byBlock);
   });
 
   test('reports totals to the owner only', async () => {

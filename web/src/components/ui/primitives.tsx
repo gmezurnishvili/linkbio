@@ -1,6 +1,12 @@
 "use client";
 
-import type { ButtonHTMLAttributes, InputHTMLAttributes, ReactNode } from "react";
+import { useEffect, useRef } from "react";
+import type {
+  ButtonHTMLAttributes,
+  InputHTMLAttributes,
+  KeyboardEvent as ReactKeyboardEvent,
+  ReactNode,
+} from "react";
 import type { Dimension } from "@/lib/api/types";
 
 export function cx(...parts: (string | false | null | undefined)[]) {
@@ -79,14 +85,18 @@ export function Field({
   error,
   children,
 }: {
-  label: string;
+  label?: string;
   hint?: string;
   error?: string;
   children: ReactNode;
 }) {
+  // A <label> with no text names the control it wraps as the empty string,
+  // which is worse for a screen reader than no label element at all. Without
+  // one, the control carries its own aria-label and this is only a layout box.
+  const Wrapper = label ? "label" : "div";
   return (
-    <label className="flex flex-col gap-1.5">
-      <span className="text-[0.8125rem] text-muted">{label}</span>
+    <Wrapper className="flex flex-col gap-1.5">
+      {label ? <span className="text-[0.8125rem] text-muted">{label}</span> : null}
       {children}
       {error ? (
         <span role="alert" className="text-[0.75rem] text-alert">
@@ -95,7 +105,7 @@ export function Field({
       ) : hint ? (
         <span className="text-[0.75rem] text-faint">{hint}</span>
       ) : null}
-    </label>
+    </Wrapper>
   );
 }
 
@@ -163,7 +173,17 @@ export function Toggle({
   );
 }
 
-/** Right-hand drawer. Nothing in the editor needs a modal dialog. */
+const FOCUSABLE =
+  'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
+
+/**
+ * Right-hand drawer.
+ *
+ * It covers the editor, so while it is open it has to behave like a modal
+ * dialog even though it doesn't look like one: focus moves in, stays in, and
+ * goes back to whatever opened it. Escape only ever worked if focus was already
+ * inside, which it never was — the row that opens a sheet sits outside it.
+ */
 export function Sheet({
   open,
   onClose,
@@ -177,9 +197,66 @@ export function Sheet({
   children: ReactNode;
   footer?: ReactNode;
 }) {
+  const rootRef = useRef<HTMLDivElement>(null);
+  const panelRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    const root = rootRef.current;
+    const panel = panelRef.current;
+    if (!open || !root || !panel) return;
+
+    const opener = document.activeElement;
+    panel.focus();
+
+    // Everything behind the scrim is unreachable by pointer already; `inert`
+    // says the same to the tab order and to a screen reader. Walking the
+    // sheet's own ancestors keeps this true without a portal.
+    const held: HTMLElement[] = [];
+    for (let node: HTMLElement | null = root; node && node !== document.body; ) {
+      const parent: HTMLElement | null = node.parentElement;
+      for (const sibling of Array.from(parent?.children ?? [])) {
+        if (sibling === node || !(sibling instanceof HTMLElement) || sibling.inert) continue;
+        sibling.inert = true;
+        held.push(sibling);
+      }
+      node = parent;
+    }
+
+    return () => {
+      for (const el of held) el.inert = false;
+      if (opener instanceof HTMLElement && opener.isConnected) opener.focus();
+    };
+  }, [open]);
+
+  function onKeyDown(e: ReactKeyboardEvent<HTMLDivElement>) {
+    if (e.key === "Escape") {
+      e.stopPropagation();
+      onClose();
+      return;
+    }
+    if (e.key !== "Tab") return;
+
+    const panel = panelRef.current;
+    if (!panel) return;
+    const stops = Array.from(panel.querySelectorAll<HTMLElement>(FOCUSABLE));
+    const first = stops[0];
+    const last = stops[stops.length - 1];
+    if (!first || !last) {
+      e.preventDefault();
+      return;
+    }
+    if (e.shiftKey && (document.activeElement === first || document.activeElement === panel)) {
+      e.preventDefault();
+      last.focus();
+    } else if (!e.shiftKey && document.activeElement === last) {
+      e.preventDefault();
+      first.focus();
+    }
+  }
+
   if (!open) return null;
   return (
-    <div className="fixed inset-0 z-40 flex justify-end">
+    <div ref={rootRef} className="fixed inset-0 z-40 flex justify-end" onKeyDown={onKeyDown}>
       <div
         className="absolute inset-0 bg-ink/15"
         onClick={onClose}
@@ -187,12 +264,12 @@ export function Sheet({
         aria-hidden="true"
       />
       <div
+        ref={panelRef}
         role="dialog"
+        aria-modal="true"
         aria-label={title}
-        className="relative flex h-full w-full max-w-[26rem] flex-col border-l border-line bg-panel"
-        onKeyDown={(e) => {
-          if (e.key === "Escape") onClose();
-        }}
+        tabIndex={-1}
+        className="relative flex h-full w-full max-w-[26rem] flex-col border-l border-line bg-panel outline-none"
       >
         <header className="flex items-center justify-between border-b border-line px-4 py-3">
           <h2 className="text-[0.9375rem] font-medium">{title}</h2>

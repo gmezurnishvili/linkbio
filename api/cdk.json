@@ -1,0 +1,9 @@
+{
+  "app": "node --experimental-strip-types infra/app.ts",
+  "watch": { "exclude": ["node_modules/**", "dist/**", "cdk.out/**"] },
+  "context": {
+    "@aws-cdk/core:checkSecretUsage": true,
+    "@aws-cdk/aws-lambda:recognizeLayerVersion": true,
+    "@aws-cdk/core:target-partitions": ["aws"]
+  }
+}

@@ -19,9 +19,12 @@ import { useProfile } from "./profile-store";
 export function CacheCost() {
   const { state } = useProfile();
   const published = state.profile.cacheDimensions;
-  const pending = deriveCacheDimensions(state.profile.rules);
+  // Rules live on blocks now, so the estimate is over every rule on the page —
+  // which is also what the backend's own `cacheDimensionsFor` reads.
+  const rules = state.profile.blocks.flatMap((b) => b.rules);
+  const pending = deriveCacheDimensions(rules);
   const added = pending.filter((d) => !published.includes(d));
-  const variants = estimateVariants(state.profile.rules);
+  const variants = estimateVariants(rules);
 
   return (
     <div className="mt-5 rounded-desk bg-sunk px-3 py-2.5">

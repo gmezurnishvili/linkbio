@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import { api } from "@/lib/api/client";
 import type { PageMode, Theme } from "@/lib/api/types";
+import { fromLocalInput, toLocalInput } from "@/lib/datetime";
 import { handleProblem } from "@/lib/handles";
 import { Button, Chip, Field, Input, Select, cx } from "@/components/ui/primitives";
 import { useProfile } from "./profile-store";
@@ -85,11 +86,9 @@ export function SettingsForm() {
             <Input
               type="datetime-local"
               className="tnum"
-              value={p.eventAt ? p.eventAt.slice(0, 16) : ""}
+              value={p.eventAt ? toLocalInput(new Date(p.eventAt)) : ""}
               onChange={(e) =>
-                void ops.updateProfileFields({
-                  eventAt: e.target.value ? new Date(e.target.value).toISOString() : undefined,
-                })
+                void ops.updateProfileFields({ eventAt: fromLocalInput(e.target.value) })
               }
             />
           </Field>
@@ -213,13 +212,15 @@ function HandleSection() {
     <section className="flex flex-col gap-3">
       <h2 className="text-[0.9375rem] font-medium">Handle</h2>
       <Field
-        label=""
         hint="Changing it holds the old one for 90 days, so links already out in the world keep working."
         error={problem ?? (check && !check.available ? reasons[check.reason ?? ""] : undefined)}
       >
         <div className="flex items-center gap-2">
-          <span className="text-[0.8125rem] text-muted">/</span>
+          <span aria-hidden="true" className="text-[0.8125rem] text-muted">
+            /
+          </span>
           <Input
+            aria-label="Handle"
             value={handle}
             onChange={(e) => setHandle(e.target.value.replace(/[^a-z0-9._-]/gi, "").toLowerCase())}
           />

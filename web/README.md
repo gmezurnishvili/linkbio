@@ -45,19 +45,18 @@ breaking the cache:
    never from a pre-rendered duration — the HTML is cached, and "4h 12m" ages
    badly.
 
-## What the backend still needs
+## The backend
 
-Two endpoints this app calls that weren't in the original API:
+This app now talks to the real API. It used to call nine endpoints that did not
+exist and disagree with it on three more, so it only ever worked against
+`dev/mock-api.mjs` — the mock now implements the real contract, and the flow
+below is verified against both.
 
-```
-POST /v1/public/:handle/resolve   { VisitorContext } -> Resolution
-POST /v1/profiles/:id/preview     { VisitorContext } -> Resolution (draft, with trace)
-```
+`POST /v1/public/:handle/resolve` and `POST /v1/profiles/:id/preview` both
+return a `Resolution`: the resolved blocks, `sMaxAge`, `varyOn`, `published`,
+the decision `trace` (preview only) and any evaluator `warnings`.
 
-`Resolution` carries the resolved blocks, `sMaxAge`, `varyOn`, the decision
-`trace`, and any evaluator `warnings`. The shape is in `lib/api/types.ts`.
-
-Every write is expected to take `If-Match: <version>` and return
+Every write takes `If-Match: <version>` and returns
 `{ data, version, cacheDimensions }`. The client treats version and mask as
 server-owned; see below.
 
@@ -89,9 +88,13 @@ single-sided probe silently misses fall-back ambiguity — remains the authority
 and its saved warnings render alongside.
 
 **Validation is the server's schema.** `lib/rules/schema.ts` mirrors the
-backend's Zod objects. Move them into a shared package; a copy that drifts is
-worse than no client validation, because the form will accept input the server
-rejects.
+backend's Zod objects — genuinely, now. It used to share no vocabulary with
+them at all (`{dimension, op, values}` against `{dim, in}`, ISO-2 countries
+against six geo buckets, an `os` dimension the backend has never had), which is
+the exact failure its own header warned about: a copy that drifts is worse than
+no client validation, because the form accepts input the server rejects. Rules
+are per-block and replaced as a whole set, matching the backend's model. Moving
+both into a shared `@linkctx/schemas` package is still the real fix.
 
 ## Swapping in the typed client
 
@@ -145,7 +148,7 @@ cp .env.example .env.local     # point API_ORIGIN at the Hono server
 npm install
 npm run dev
 npm run typecheck
-npm test                        # 28 tests, no network, no AWS
+npm test                        # 86 tests, no network, no AWS
 ```
 
 The tests cover the pure logic that is easy to get wrong and hard to notice:
@@ -159,7 +162,7 @@ Nothing here needs AWS. Two processes, two terminals.
 
 ```sh
 # terminal 1 — the Hono server, in-memory
-cd ../api && DB_DRIVER=memory PORT=8787 npm run dev
+cd ../api && DB_DRIVER=memory AUTH_SECRET=a-secret-of-at-least-32-bytes-long PORT=8787 npm run dev
 
 # terminal 2 — this app
 cd web && cp .env.example .env.local && npm install && npm run dev
@@ -172,17 +175,21 @@ beacon endpoint does get hit cross-origin, by `sendBeacon` with a `text/plain`
 body: that is a simple request, so no preflight, but it must accept a POST with
 no `Authorization` header.
 
-### Before the real backend can drive this
+### Two 409s, not one
 
-Four things the frontend assumes:
+The backend answers 409 for a stale `If-Match` (`title: "version_conflict"`,
+carrying `current`) and for a real conflict such as a taken handle or the block
+limit (`title: "conflict"`). The client keys on the title, not the status —
+keying on the status meant hitting the 200-block cap raised "this page changed
+somewhere else — another tab, or someone else on the account".
 
-1. `POST /v1/public/:handle/resolve` and `POST /v1/profiles/:id/preview`, both
-   returning `Resolution` — blocks, `sMaxAge`, `varyOn`, `trace`, `warnings`.
-2. `GET /v1/me` returning the signed-in user and their profiles.
-3. Every write accepts `If-Match: <version>`, returns 409 when stale, and
-   answers `{ data, version, cacheDimensions }` on success.
-4. `POST /v1/auth/token` and `/v1/auth/refresh` returning
-   `{ accessToken, refreshToken, expiresIn }`. Local HS256 is fine for dev.
+### Refresh rotates
+
+`/v1/auth/refresh` returns a new refresh token and spends the old one, and a
+*second* use of a spent token is treated as a leak and revokes every session for
+that user. `lib/auth/session.ts` therefore single-flights the exchange: without
+that, two requests arriving together after the access cookie expires would both
+spend the same token and log the user out everywhere.
 
 ### Running against the mock instead
 
