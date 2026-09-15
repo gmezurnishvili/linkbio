@@ -1,0 +1,28 @@
+{
+  "name": "linkbio-api",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "node --experimental-strip-types --watch src/local.ts",
+    "start": "node --experimental-strip-types src/local.ts",
+    "test": "node --experimental-strip-types --test \"test/*.test.ts\"",
+    "typecheck": "tsc --noEmit",
+    "build": "esbuild src/lambda.ts --bundle --platform=node --target=node22 --format=esm --outfile=dist/index.mjs --sourcemap --banner:js=\"import{createRequire}from'module';const require=createRequire(import.meta.url);\"",
+    "build:slim": "esbuild src/lambda.ts --bundle --platform=node --target=node22 --format=esm --outfile=dist/index.mjs --sourcemap --banner:js=\"import{createRequire}from'module';const require=createRequire(import.meta.url);\" --external:@aws-sdk/client-dynamodb --external:@aws-sdk/lib-dynamodb"
+  },
+  "dependencies": {
+    "@aws-sdk/client-cloudfront-keyvaluestore": "^3.700.0",
+    "@aws-sdk/client-dynamodb": "^3.700.0",
+    "@aws-sdk/lib-dynamodb": "^3.700.0",
+    "@hono/node-server": "^1.13.7",
+    "@hono/zod-validator": "^0.9.1",
+    "hono": "^4.6.13",
+    "jose": "^5.9.6",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "esbuild": "^0.24.0",
+    "typescript": "^5.7.2"
+  }
+}
