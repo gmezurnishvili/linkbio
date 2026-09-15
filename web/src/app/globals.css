@@ -1,0 +1,79 @@
+@import "tailwindcss";
+
+/*
+ * The dashboard reads as a routing desk, not a social tool. A creator here is
+ * asking "what does an iOS visitor from Berlin see at 11pm on a Saturday", so
+ * the surface borrows from signage and patch bays: cool paper, tabular
+ * numerals, hairlines instead of cards, and colour used only to name a context
+ * dimension. Geo is blue, device is violet, time is amber, everywhere in the
+ * product — the left rail on a block row, a condition chip, a trace line.
+ */
+
+@theme {
+  --color-paper: #f4f5f7;
+  --color-panel: #ffffff;
+  --color-sunk: #eceef1;
+  --color-ink: #141a22;
+  --color-muted: #6b7480;
+  --color-faint: #9aa3ad;
+  --color-line: #dfe2e7;
+  --color-line-strong: #c4c9d1;
+
+  --color-geo: #1b4fd8;
+  --color-geo-wash: #e8edfb;
+  --color-device: #5b3fc4;
+  --color-device-wash: #eeeafa;
+  --color-clock: #9c5a00;
+  --color-clock-wash: #fbf0dd;
+  --color-alert: #a8201c;
+  --color-alert-wash: #fbeceb;
+  --color-live: #0f6e56;
+  --color-live-wash: #e4f3ee;
+
+  --font-sans: var(--font-instrument), -apple-system, BlinkMacSystemFont, sans-serif;
+  --font-mono: var(--font-plex-mono), ui-monospace, SFMono-Regular, monospace;
+
+  --radius-desk: 10px;
+}
+
+html,
+body {
+  height: 100%;
+}
+
+body {
+  background: var(--color-paper);
+  color: var(--color-ink);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Numbers that sit in columns — ranks, counts, TTLs — must not reflow as they
+   change during a drag or a debounced preview. */
+.tnum {
+  font-variant-numeric: tabular-nums;
+}
+
+*:focus-visible {
+  outline: 2px solid var(--color-geo);
+  outline-offset: 2px;
+  border-radius: 3px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    transition-duration: 0.01ms !important;
+    animation-duration: 0.01ms !important;
+  }
+}
+
+/* dnd-kit lifts the dragged row out of flow; the placeholder below it should
+   read as a slot, not as an empty card. */
+.is-dragging {
+  background: var(--color-sunk);
+}
+.is-dragging > * {
+  opacity: 0;
+}
