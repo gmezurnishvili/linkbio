@@ -1,5 +1,5 @@
 import type { Block, DailyStat, Profile, User, RefreshRecord } from '../domain/types.ts';
-import { TOMBSTONE_DAYS } from '../domain/types.ts';
+import { nextFeedDueAt, shardFor, TOMBSTONE_DAYS } from '../domain/types.ts';
 import type { TClickEvent } from '../domain/schema.ts';
 import {
   ConflictError, NotFoundError, VersionConflictError,
@@ -187,16 +187,21 @@ export class MemoryRepo implements Repo {
   }
 
   async putBlock(block: Block) {
-    this.blocks.set(this.bk(block.profileId, block.id), this.clone(block));
-    return this.clone(block);
+    // DynamoDB's document client is configured with `removeUndefinedValues`, so
+    // writing `{ feedError: undefined }` there deletes the attribute and a
+    // later read has no such key. Keeping the key with an undefined value here
+    // is the kind of divergence the conformance suite exists to catch, so the
+    // memory side drops them too.
+    const stored = dropUndefined(this.clone(block));
+    this.blocks.set(this.bk(block.profileId, block.id), stored);
+    return this.clone(stored);
   }
 
   async updateBlock(profileId: string, blockId: string, patch: Partial<Block>) {
     const b = this.blocks.get(this.bk(profileId, blockId));
     if (!b) throw new NotFoundError(blockId);
     const next = { ...b, ...patch, id: b.id, profileId: b.profileId, rank: b.rank, updatedAt: Date.now() };
-    this.blocks.set(this.bk(profileId, blockId), next);
-    return this.clone(next);
+    return this.putBlock(next);
   }
 
   async moveBlock(profileId: string, blockId: string, newRank: string) {
@@ -252,13 +257,23 @@ export class MemoryRepo implements Repo {
 
   async getBlockTotals(profileId: string) { return this.clone(this.totals.get(profileId) ?? {}); }
 
-  async dueForRefresh(_shard: number, now: number, limit: number) {
+  async dueForRefresh(shard: number, now: number, limit: number) {
     return [...this.blocks.values()]
       .filter((b) => b.kind === 'feed')
-      // Keyed off the last fetch, not the last edit, so renaming a feed block
-      // no longer pushes its refresh a full TTL into the future.
-      .filter((b) => ((b.feedRefreshedAt ?? 0) + (b.feed?.ttlSeconds ?? 3600) * 1000) <= now)
+      // DynamoDB reads one shard's partition of the sparse index, so the same
+      // call here has to see one shard's worth too — otherwise a refresher that
+      // walks all ten shards processes every block ten times against memory and
+      // once against production, and only one of those is tested.
+      .filter((b) => shardFor(b.id) === shard)
+      .filter((b) => nextFeedDueAt(b) <= now)
+      .sort((a, b) => nextFeedDueAt(a) - nextFeedDueAt(b))
       .slice(0, limit)
       .map(this.clone);
   }
+}
+
+/** Mirrors the document client's `removeUndefinedValues` marshalling option. */
+function dropUndefined<T extends object>(v: T): T {
+  for (const k of Object.keys(v) as (keyof T)[]) if (v[k] === undefined) delete v[k];
+  return v;
 }

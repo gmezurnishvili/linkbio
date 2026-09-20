@@ -96,6 +96,14 @@ no client validation, because the form accepts input the server rejects. Rules
 are per-block and replaced as a whole set, matching the backend's model. Moving
 both into a shared `@linkctx/schemas` package is still the real fix.
 
+**Block kinds are the backend's, exactly.** `link`, `header`, `embed`, `feed` —
+`BLOCK_KINDS` in `api/src/domain/schema.ts` and nothing else. The renderer used
+to carry arms for `gate` and `text`, which the backend cannot produce, and to
+have none for `header`, which it can; the client papered over the gap by
+translating `header` to `text` on the way through. A `RenderedBlockKind` wider
+than `BlockKind` is what let those arms sit unreachable without the compiler
+saying anything, so the two types are one type now.
+
 ## Swapping in the typed client
 
 `lib/api/client.ts` is hand-written so this app builds standalone. In a shared
@@ -126,14 +134,24 @@ dashboard is uncached anyway.
   builds its key from the KeyValueStore mask and ignores this, but an
   intermediary proxy would fragment on `rsc`. Strip it in an origin-response
   function, or accept it.
-- **CSP uses `'unsafe-inline'`** for the one style and one script block. Both
-  are ours, not creator input, but the hashes change per theme, so a nonce
-  would defeat edge caching. Hashing the literal blocks at build time is the
-  version to move to.
+- **Embeds are an allowlist, and the CSP is derived from what was framed.**
+  `lib/site/embed.ts` recognises YouTube, Spotify, SoundCloud, Vimeo and Apple
+  Music, and anything else stays a link card. The page is `default-src 'none'`,
+  so `renderProfileDocument` hands back the hosts it actually framed and the
+  route handler names exactly those in `frame-src` — add a provider without
+  extending `EMBED_HOSTS` and the player silently never loads. The iframes are
+  deliberately not sandboxed: a cross-origin frame is already isolated, and the
+  attributes a player needs (`allow-scripts allow-same-origin`) are the pair
+  that makes `sandbox` a no-op.
+- **A feed block renders nothing until the refresher has run.** `feedBlock`
+  returns an empty string for zero items, which from the editor is
+  indistinguishable from the block not having saved — so the block sheet shows
+  the fetch state and the last `feedError` explicitly. Feeds fill in on the
+  backend's schedule, not on save.
 - **`estimateVariants`** counts each named value plus a fallthrough bucket,
   which is an upper bound, not a measurement. Once real traffic exists, replace
   it with observed cache-key cardinality.
-- **No analytics.** Deliberately out of scope for this pass. When it lands, the
+- **No analytics.** Deliberately out of scope for the MVP. When it lands, the
   top line should read from the DynamoDB counters and anything Athena-backed
   should sit behind an explicit "run report" with polling — a dashboard that
   looks real-time and takes nine seconds to paint is worse than one that says

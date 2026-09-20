@@ -8,6 +8,8 @@ import * as logs from 'aws-cdk-lib/aws-logs';
 import * as sm from 'aws-cdk-lib/aws-secretsmanager';
 import * as wafv2 from 'aws-cdk-lib/aws-wafv2';
 import * as cw from 'aws-cdk-lib/aws-cloudwatch';
+import * as events from 'aws-cdk-lib/aws-events';
+import * as targets from 'aws-cdk-lib/aws-events-targets';
 import type { Construct } from 'constructs';
 
 export type LinkbioStackProps = StackProps & {
@@ -17,6 +19,18 @@ export type LinkbioStackProps = StackProps & {
   jwtAudience?: string;
   /** Exact browser origins allowed to call the API cross-origin. */
   corsOrigins?: string[];
+  /**
+   * Credentials for the feed sources that have no anonymous read path, as
+   * Secrets Manager ARNs. Omitting one leaves that source reporting itself
+   * unconfigured at refresh time rather than failing the deploy — a stack with
+   * no Spotify blocks should not be made to hold Spotify credentials.
+   */
+  spotifySecretArn?: string;
+  twitchSecretArn?: string;
+  /** Raises the GitHub adapter from 60 requests an hour to 5,000. */
+  githubTokenSecretArn?: string;
+  /** How often the feed refresher runs. Defaults to every five minutes. */
+  refreshRate?: Duration;
 };
 
 export class LinkbioStack extends Stack {
@@ -121,6 +135,75 @@ export class LinkbioStack extends Stack {
     }));
 
     const fnUrl = api.addFunctionUrl({ authType: lambda.FunctionUrlAuthType.AWS_IAM });
+
+    // ---------- feed refresher ----------
+    //
+    // Its own function rather than a route on the API. It waits on five third
+    // parties, so it needs a timeout six times the API's; and a feed that hangs
+    // must not be able to eat the concurrency a creator's dashboard is using.
+    //
+    // Idempotent by construction — the work list is a due-time index and the
+    // first thing each refresh does is push that time forward — so EventBridge
+    // firing twice duplicates a fetch and corrupts nothing.
+
+    const spotify = props?.spotifySecretArn
+      ? sm.Secret.fromSecretCompleteArn(this, 'SpotifySecret', props.spotifySecretArn)
+      : undefined;
+    const twitch = props?.twitchSecretArn
+      ? sm.Secret.fromSecretCompleteArn(this, 'TwitchSecret', props.twitchSecretArn)
+      : undefined;
+    const githubToken = props?.githubTokenSecretArn
+      ? sm.Secret.fromSecretCompleteArn(this, 'GithubTokenSecret', props.githubTokenSecretArn)
+      : undefined;
+
+    const refresher = new lambda.Function(this, 'FeedRefresher', {
+      runtime: lambda.Runtime.NODEJS_22_X,
+      architecture: lambda.Architecture.ARM_64,
+      handler: 'index.handler',
+      code: lambda.Code.fromAsset('dist-refresher'),
+      memorySize: 512,
+      timeout: Duration.seconds(60),
+      logGroup: new logs.LogGroup(this, 'FeedRefresherLogs', {
+        retention: logs.RetentionDays.ONE_MONTH,
+        removalPolicy: RemovalPolicy.DESTROY,
+      }),
+      // One run at a time. Two overlapping runs would each fetch the same due
+      // blocks — harmless, but it doubles the rate-limit pressure on YouTube
+      // and GitHub for no gain.
+      reservedConcurrentExecutions: 1,
+      deadLetterQueueEnabled: true,
+      environment: {
+        TABLE_NAME: table.tableName,
+        NODE_ENV: 'production',
+        NODE_OPTIONS: '--enable-source-maps',
+        // The refresher issues no tokens and verifies none, but `env.ts` parses
+        // one schema for the whole codebase and refuses to boot without a
+        // signing secret. Sharing the API's costs nothing and keeps the config
+        // contract in one place.
+        AUTH_SECRET: authSecret.secretValueFromJson('secret').unsafeUnwrap(),
+        ...(spotify
+          ? {
+              SPOTIFY_CLIENT_ID: spotify.secretValueFromJson('clientId').unsafeUnwrap(),
+              SPOTIFY_CLIENT_SECRET: spotify.secretValueFromJson('clientSecret').unsafeUnwrap(),
+            }
+          : {}),
+        ...(twitch
+          ? {
+              TWITCH_CLIENT_ID: twitch.secretValueFromJson('clientId').unsafeUnwrap(),
+              TWITCH_CLIENT_SECRET: twitch.secretValueFromJson('clientSecret').unsafeUnwrap(),
+            }
+          : {}),
+        ...(githubToken ? { GITHUB_TOKEN: githubToken.secretValueFromJson('token').unsafeUnwrap() } : {}),
+      },
+    });
+
+    table.grantReadWriteData(refresher);
+
+    new events.Rule(this, 'FeedRefreshSchedule', {
+      description: 'Fills feed blocks whose TTL has elapsed',
+      schedule: events.Schedule.rate(props?.refreshRate ?? Duration.minutes(5)),
+      targets: [new targets.LambdaFunction(refresher, { retryAttempts: 0 })],
+    });
 
     // ---------- distribution ----------
 
@@ -278,10 +361,14 @@ export class LinkbioStack extends Stack {
       'Concurrency limit reached — requests are being rejected before they run.');
     alarm('Api5xx', dist.metric5xxErrorRate({ period: Duration.minutes(5) }), 1,
       'CloudFront is serving 5xx for more than 1% of requests.');
+    alarm('FeedRefresherErrors', refresher.metricErrors({ period: Duration.minutes(15) }), 2,
+      'The feed refresher is throwing. Individual feed failures are backed off per block and logged, '
+      + 'not thrown, so this means the loop itself is broken.');
 
     new CfnOutput(this, 'AuthSecretArn', { value: authSecret.secretArn });
     new CfnOutput(this, 'DistributionDomain', { value: dist.distributionDomainName });
     new CfnOutput(this, 'TableName', { value: table.tableName });
     new CfnOutput(this, 'KvsArn', { value: kvs.keyValueStoreArn });
+    new CfnOutput(this, 'FeedRefresherName', { value: refresher.functionName });
   }
 }

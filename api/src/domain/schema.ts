@@ -24,7 +24,7 @@ const RESERVED = new Set([
  * these targets today, but `dueForRefresh` exists to add exactly that, and
  * `avatarUrl` and `feed.ref` are already creator-supplied.
  */
-function isPrivateHost(raw: string): boolean {
+export function isPrivateHost(raw: string): boolean {
   const h = raw.toLowerCase().replace(/\.$/, '');
   if (h === 'localhost' || h.endsWith('.localhost') || h.endsWith('.internal') || h.endsWith('.local')) return true;
 
@@ -91,6 +91,19 @@ export const SafeUrl = z.string().url().max(2048).superRefine((v, ctx) => {
     ctx.addIssue({ code: 'custom', message: 'private or link-local hosts not allowed' });
   }
 });
+
+/**
+ * The same gate as `SafeUrl`, as a predicate, for code that holds a URL rather
+ * than a schema — the feed fetcher, which follows redirects and has to re-check
+ * every hop. A redirect to `http://169.254.169.254/` is the whole reason the
+ * fetcher cannot simply hand the URL to `fetch` and let it follow.
+ */
+export function isPublicHttpUrl(raw: string): boolean {
+  let u: URL;
+  try { u = new URL(raw); } catch { return false; }
+  if (u.protocol !== 'https:' && u.protocol !== 'http:') return false;
+  return !isPrivateHost(u.hostname);
+}
 
 const Hm = z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/, 'expected HH:mm');
 const Tz = z.string().refine((t) => {

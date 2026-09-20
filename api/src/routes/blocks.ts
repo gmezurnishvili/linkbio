@@ -4,7 +4,7 @@ import { BlockCreateChecked, BlockPatch, MoveBlock, RuleSet, checkBlockShape } f
 import { badRequest, conflict, fromRepo, notFound } from '../errors.ts';
 import { RankExhausted, rankBetween } from '../rank.ts';
 import { newId } from '../ids.ts';
-import { publishMask } from '../publish.ts';
+import { publishRouting } from '../publish.ts';
 import { envelope, gate } from './mutation.ts';
 import { env } from '../env.ts';
 import { z } from 'zod';
@@ -33,10 +33,16 @@ const rethrow = (e: unknown): never => {
  * the edge from the rules — the rules route used to swallow it and answer 200,
  * so a KeyValueStore outage looked like success.
  */
-async function republish(c: { var: Env['Variables'] }, profileId: string) {
+async function republish(
+  c: { var: Env['Variables'] },
+  profileId: string,
+  opts: { removedBlockIds?: string[] } = {},
+) {
   const profile = await c.var.repo.getProfile(profileId);
   if (!profile) throw notFound('profile not found');
-  await publishMask(profile, await c.var.repo.listBlocks(profileId));
+  // A deleted block is gone from `listBlocks` by the time this runs, so its
+  // hot-link key has nothing left to derive a delete from. The caller names it.
+  await publishRouting(profile, await c.var.repo.listBlocks(profileId), opts);
 }
 
 blocks.get('/', async (c) => c.json({ blocks: await c.var.repo.listBlocks(c.get('profile').id) }));
@@ -181,7 +187,8 @@ blocks.delete('/:blockId', async (c) => {
   const profile = c.get('profile');
   const profileId = profile.id;
   await gate(c, c.var.repo, profile).catch(rethrow);
-  await c.var.repo.deleteBlock(profileId, c.req.param('blockId'));
-  await republish(c, profileId);
+  const removed = c.req.param('blockId');
+  await c.var.repo.deleteBlock(profileId, removed);
+  await republish(c, profileId, { removedBlockIds: [removed] });
   return c.body(null, 204);
 });

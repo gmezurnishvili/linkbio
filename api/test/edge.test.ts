@@ -9,6 +9,9 @@ process.env.NODE_ENV = 'test';
 
 const { ALL_CTX_DIMS, ctxDims, ctxVersion, decodeCtx, refClass, viewerCtx } =
   await import('../src/auth.ts');
+// The producer of the hot-link value, so the edge is tested against the exact
+// bytes the API writes rather than against a hand-copied format that can drift.
+const { hotValue } = await import('../src/publish.ts');
 
 /**
  * `edge/normalize.js` is a CloudFront Function: it imports the `cloudfront`
@@ -43,6 +46,7 @@ const g = globalThis as Record<string, unknown>;
  */
 g.__EDGE_KVS__ = {
   async get(key: string) {
+    (g.__EDGE_PROBE__ as ((k: string) => void) | undefined)?.(key);
     const store = (g.__EDGE_STORE__ ?? {}) as Record<string, string>;
     const v = store[key];
     if (v === undefined) throw new Error('KeyNotFound');
@@ -62,8 +66,9 @@ const edgeModule = await import(
   `data:text/javascript;base64,${Buffer.from(edgeSource).toString('base64')}`
 ) as EdgeModule;
 
-function loadEdge(store: Record<string, string>): EdgeModule {
+function loadEdge(store: Record<string, string>, onGet?: (key: string) => void): EdgeModule {
   g.__EDGE_STORE__ = store;
+  g.__EDGE_PROBE__ = onGet;
   return edgeModule;
 }
 
@@ -283,12 +288,46 @@ describe('x-ctx is origin-controlled', () => {
   });
 
   test('a hot-path hit short-circuits to a redirect and never reaches the origin', async () => {
-    const edge = loadEdge({ 'hot:erin/blk1': 'https://hot.example|307' });
+    const edge = loadEdge({ 'hot:erin/blk1': hotValue('https://hot.example', 307) });
     const out = await edge.handler({
       request: { uri: '/r/erin/blk1', headers: cfHeaders(VIEWER) },
     });
     assert.equal(out.statusCode, 307);
     assert.equal(out.headers['location']!.value, 'https://hot.example');
+  });
+
+  test('a destination containing a pipe survives the encoding', async () => {
+    // Legal in a query string, and the reason the status leads: splitting on
+    // every separator cut the target at the first one.
+    const target = 'https://shop.example/x?utm=a|b&ref=c';
+    const edge = loadEdge({ 'hot:erin/blk1': hotValue(target) });
+    const out = await edge.handler({
+      request: { uri: '/r/erin/blk1', headers: cfHeaders(VIEWER) },
+    });
+    assert.equal(out.statusCode, 302);
+    assert.equal(out.headers['location']!.value, target);
+  });
+
+  test('a corrupt hot entry falls through to the origin rather than redirecting', async () => {
+    // Better a cache miss than a 302 to an empty Location, or to a status the
+    // rule engine would never emit.
+    for (const bad of ['', '|', '301|https://x.example', '302|', 'https://x.example']) {
+      const edge = loadEdge({ 'hot:erin/blk1': bad });
+      const out = await edge.handler({
+        request: { uri: '/r/erin/blk1', headers: cfHeaders(VIEWER) },
+      });
+      assert.ok(out.headers['x-ctx'], `"${bad}" should have fallen through to the origin`);
+      assert.equal(out.statusCode, undefined);
+    }
+  });
+
+  test('the page path never looks up a hot link', async () => {
+    // `/p/erin` splits to a slug of '', and `hot:erin/` is a key the API never
+    // writes — but asking for it is a KeyValueStore read on every page view.
+    let asked = 0;
+    const edge = loadEdge({}, (k) => { if (k.startsWith('hot:')) asked += 1; });
+    await edge.handler({ request: { uri: '/p/erin', headers: cfHeaders(VIEWER) } });
+    assert.equal(asked, 0);
   });
 });
 

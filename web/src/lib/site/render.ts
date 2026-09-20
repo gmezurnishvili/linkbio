@@ -2,6 +2,7 @@ import type { CacheDimension, Resolution, ResolvedBlock } from "@/lib/api/types"
 import { BASE_CSS, themeVariables } from "./theme";
 import { runtimeScript } from "./runtime";
 import { safeHref, safeUrl } from "./url";
+import { resolveEmbed, type Embed } from "./embed";
 
 /**
  * The public profile is rendered to an HTML string rather than through React.
@@ -36,6 +37,16 @@ export interface ProfileDocument {
   style: string;
   /** Exactly what sits between <script> and </script>. */
   script: string;
+  /**
+   * The hosts this page actually framed, for `frame-src`.
+   *
+   * Handed back for the same reason the style and script are: the page is
+   * `default-src 'none'`, so a host the caller does not name is a player that
+   * silently does not load. Deriving it from the rendered output rather than
+   * from the allowlist keeps the directive to what this page needs — a page
+   * with one YouTube embed should not be permitted to frame Spotify.
+   */
+  frameHosts: string[];
 }
 
 /**
@@ -56,6 +67,16 @@ export function renderProfileDocument(opts: RenderOptions): ProfileDocument {
 
   const style = `:root{${themeVariables(p.theme)}}${BASE_CSS}`;
   const script = runtimeScript(beaconUrl);
+
+  // Rendered before the document string so the frame hosts are known by the
+  // time the caller needs them; `block()` reads from this rather than resolving
+  // twice and risking a mismatch between what was framed and what was allowed.
+  const embeds = new Map<string, Embed>();
+  for (const b of resolution.blocks) {
+    if (b.kind !== "embed") continue;
+    const e = resolveEmbed(b.target ?? b.href);
+    if (e) embeds.set(b.id, e);
+  }
 
   const html = `<!DOCTYPE html>
 <html lang="en">
@@ -85,7 +106,7 @@ ${preview ? `<meta name="robots" content="noindex">` : ""}
 ${header(opts)}
 ${countdown(opts)}
 <div class="stack">
-${resolution.blocks.map((b) => block(b, p.handle)).join("\n")}
+${resolution.blocks.map((b) => block(b, p.handle, embeds)).join("\n")}
 </div>
 ${resolution.blocks.length === 0 ? `<p class="note">Nothing here yet.</p>` : ""}
 <p class="foot">${esc(p.handle)}</p>
@@ -94,7 +115,7 @@ ${resolution.blocks.length === 0 ? `<p class="note">Nothing here yet.</p>` : ""}
 </body>
 </html>`;
 
-  return { html, style, script };
+  return { html, style, script, frameHosts: [...new Set([...embeds.values()].map((e) => e.host))] };
 }
 
 /** The page on its own, for callers with no CSP to build (the simulator). */
@@ -129,25 +150,60 @@ function countdown({ resolution }: RenderOptions): string {
 </div>`;
 }
 
-function block(b: ResolvedBlock, handle: string): string {
+/**
+ * One block, by kind.
+ *
+ * The arms here are exactly `BLOCK_KINDS` from the backend and nothing else.
+ * There were previously arms for `text` and `gate`, which the backend cannot
+ * produce and a creator therefore could not reach, and no arm for `header`,
+ * which it can — so a heading fell through to the link renderer and rendered as
+ * a clickable card with no destination and an empty hint line.
+ */
+function block(b: ResolvedBlock, handle: string, embeds: Map<string, Embed>): string {
   switch (b.kind) {
     case "feed":
       return feedBlock(b);
-    case "text":
-      return `<p class="note">${esc(b.label)}</p>`;
-    case "gate":
-      return `<a class="block" href="${esc(safeHref(b.href ?? `/${handle}/l/${b.slug ?? b.id}`))}"
-  data-block="${esc(b.id)}"${b.slug ? ` data-slug="${esc(b.slug)}"` : ""}>
-  <span class="tick" aria-hidden="true"></span>
-  <span class="block-label">${esc(b.label)}${
-    b.gate ? `<span class="gate-prompt">${esc(b.gate.prompt)}</span>` : ""
-  }</span>
-</a>`;
+    case "header":
+      return headerBlock(b);
+    case "embed": {
+      const e = embeds.get(b.id);
+      // An unrecognised provider is still a link the visitor can follow. The
+      // alternative — rendering nothing — loses the block entirely because the
+      // creator pasted a URL from a service this does not have a player for.
+      return e ? embedBlock(b, e) : linkBlock(b, handle);
+    }
     case "link":
-    case "embed":
     default:
       return linkBlock(b, handle);
   }
+}
+
+/**
+ * A heading, which is a label and no destination.
+ *
+ * It is a section divider in a list of links, so it is `<h2>` rather than a
+ * styled paragraph: a screen-reader user navigating by heading is the reason
+ * the kind exists at all.
+ */
+function headerBlock(b: ResolvedBlock): string {
+  return `<h2 class="section" data-block="${esc(b.id)}">${esc(b.label)}</h2>`;
+}
+
+/**
+ * A player from an allowlisted provider.
+ *
+ * No click beacon: the runtime listens for `pointerdown` on `[data-block]`, and
+ * a pointer landing on an iframe is a play, a scrub or a volume change, not a
+ * click-through. Counting those as link clicks would be worse than counting
+ * nothing.
+ */
+function embedBlock(b: ResolvedBlock, e: Embed): string {
+  return `<div class="embed" style="aspect-ratio:${esc(e.ratio)}">
+  <iframe src="${esc(e.src)}" title="${esc(b.label)} — ${esc(e.provider)}"
+    loading="lazy" referrerpolicy="strict-origin-when-cross-origin"
+    allow="accelerometer; autoplay; clipboard-write; encrypted-media; fullscreen; picture-in-picture"
+    allowfullscreen></iframe>
+</div>`;
 }
 
 function linkBlock(b: ResolvedBlock, handle: string): string {
@@ -213,9 +269,12 @@ export function jsonLd({ resolution, origin }: RenderOptions): string {
     // An agent reading this document will follow what it finds here, so the
     // same scheme rule applies as in the markup. A rejected URL is dropped
     // rather than replaced: "#" would be worse than saying nothing.
+    // `target`, not `href`. `href` is `/r/:handle/:id`, so every entry used to
+    // be a self-reference back into this site — the opposite of what sameAs is
+    // for, which is telling an agent where else this person is.
     sameAs: resolution.blocks
-      .filter((b) => b.kind === "link")
-      .map((b) => safeUrl(b.href))
+      .filter((b) => b.kind === "link" || b.kind === "embed")
+      .map((b) => safeUrl(b.target))
       .filter((href): href is string => href !== undefined)
       .slice(0, 25),
     subjectOf: resolution.blocks

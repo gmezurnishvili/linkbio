@@ -3,7 +3,7 @@ import { zValidator } from './validate.ts';
 import { ClaimHandle, ProfileCreate, ProfilePatch, VisitorContext } from '../domain/schema.ts';
 import { requireAuth } from '../auth.ts';
 import { forbidden, fromRepo, notFound } from '../errors.ts';
-import { cacheDimensionsFor, publishMask } from '../publish.ts';
+import { cacheDimensionsFor, publishRouting, retractRouting } from '../publish.ts';
 import { resolveProfile } from '../resolve.ts';
 import { envelope, ifMatch } from './mutation.ts';
 import { blocks } from './blocks.ts';
@@ -66,6 +66,11 @@ profiles.get('/:id', async (c) => {
 profiles.patch('/:id', zValidator('json', ProfilePatch), async (c) => {
   try {
     const updated = await c.var.repo.updateProfile(c.req.param('id'), c.req.valid('json'), ifMatch(c));
+    // The mask's value carries the profile version, and every profile write
+    // bumps it. Without a republish here the edge keeps announcing the old
+    // version, the origin reads that as a stale key and answers `no-store`, and
+    // a page silently stops caching after its owner edits their bio.
+    await publishRouting(updated, await c.var.repo.listBlocks(updated.id));
     return c.json(await envelope(c.var.repo, updated.id, updated));
   } catch (e) {
     return rethrow(e);
@@ -73,7 +78,12 @@ profiles.patch('/:id', zValidator('json', ProfilePatch), async (c) => {
 });
 
 profiles.delete('/:id', async (c) => {
-  await c.var.repo.deleteProfile(c.req.param('id'));
+  const p = c.get('profile');
+  // Before the rows go, not after: the edge entries are the only thing that can
+  // still answer for a handle whose profile no longer exists, and a hot link
+  // left behind would keep redirecting to a deleted page's destination.
+  await retractRouting(p, await c.var.repo.listBlocks(p.id));
+  await c.var.repo.deleteProfile(p.id);
   return c.body(null, 204);
 });
 
@@ -92,7 +102,7 @@ profiles.post('/:id/publish', async (c) => {
     const updated = await c.var.repo.updateProfile(p.id, { publishedVersion: p.version + 1 }, ifMatch(c));
     // The mask has to reach the edge before the page does, or the first viewer
     // is keyed on dimensions the rules no longer match.
-    await publishMask(updated, await c.var.repo.listBlocks(p.id));
+    await publishRouting(updated, await c.var.repo.listBlocks(p.id));
     return c.json(await envelope(c.var.repo, p.id, updated));
   } catch (e) {
     return rethrow(e);
@@ -105,6 +115,11 @@ profiles.post('/:id/handle', zValidator('json', ClaimHandle), async (c) => {
   if (handle === p.handle) return c.json(await envelope(c.var.repo, p.id, p));
   try {
     const updated = await c.var.repo.claimHandle(p.id, p.handle, handle, ifMatch(c));
+    // The edge keys routing by handle, so a rename has to move it. Skipping
+    // this orphaned `mask:<old>` under the old name — where the next creator to
+    // claim it would inherit a cache-key mask derived from someone else's
+    // rules — and left every hot link answering for a page that had moved.
+    await publishRouting(updated, await c.var.repo.listBlocks(p.id), { previousHandle: p.handle });
     return c.json(await envelope(c.var.repo, p.id, updated));
   } catch (e) {
     return rethrow(e);
@@ -119,6 +134,11 @@ profiles.put('/:id/handle', zValidator('json', ClaimHandle), async (c) => {
   if (handle === p.handle) return c.json(await envelope(c.var.repo, p.id, p));
   try {
     const updated = await c.var.repo.claimHandle(p.id, p.handle, handle, ifMatch(c));
+    // The edge keys routing by handle, so a rename has to move it. Skipping
+    // this orphaned `mask:<old>` under the old name — where the next creator to
+    // claim it would inherit a cache-key mask derived from someone else's
+    // rules — and left every hot link answering for a page that had moved.
+    await publishRouting(updated, await c.var.repo.listBlocks(p.id), { previousHandle: p.handle });
     return c.json(await envelope(c.var.repo, p.id, updated));
   } catch (e) {
     return rethrow(e);

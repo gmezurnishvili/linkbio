@@ -50,17 +50,32 @@ async function handler(event) {
   if (!handle) return req;
   var slug = parts[3] || '';
 
-  try {
-    var hot = await kvs.get('hot:' + handle + '/' + slug, { format: 'string' });
-    if (hot) {
-      var bits = hot.split('|');
-      return {
-        statusCode: parseInt(bits[1], 10) || 302,
-        statusDescription: 'Found',
-        headers: { location: { value: bits[0] } },
-      };
-    }
-  } catch (e) {}
+  // A hot link is a destination the origin would compute the same way for
+  // everyone, forever: no rules, no activity window, on a published page. The
+  // API writes those to the store on publish and deletes them the moment any of
+  // that stops being true, so an entry existing here *is* the guarantee that no
+  // evaluation is needed.
+  //
+  // `<status>|<url>`, split on the first separator only. A URL may legally
+  // contain `|` in its query, and splitting on every one of them truncated the
+  // destination to everything before it.
+  if (slug) {
+    try {
+      var hot = await kvs.get('hot:' + handle + '/' + slug, { format: 'string' });
+      if (hot) {
+        var bar = hot.indexOf('|');
+        var status = parseInt(hot.substring(0, bar), 10);
+        var location = hot.substring(bar + 1);
+        if (location && (status === 302 || status === 307)) {
+          return {
+            statusCode: status,
+            statusDescription: status === 307 ? 'Temporary Redirect' : 'Found',
+            headers: { location: { value: location } },
+          };
+        }
+      }
+    } catch (e) {}
+  }
 
   var mask = '';
   var version = '0';

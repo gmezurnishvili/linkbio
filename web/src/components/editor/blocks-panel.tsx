@@ -126,7 +126,12 @@ export function BlocksPanel() {
     void ops.createBlock({
       kind,
       label,
-      ...(kind === "link" || kind === "embed" ? { url: "https://example.com" } : {}),
+      ...(kind === "link" ? { url: "https://example.com" } : {}),
+      // An embed needs a URL to be worth anything, but the backend only
+      // *requires* one for a link — so the placeholder here is a real URL a
+      // player exists for, which means a new embed block renders as something
+      // rather than as an empty box the creator has to guess at.
+      ...(kind === "embed" ? { url: "https://www.youtube.com/watch?v=dQw4w9WgXcQ" } : {}),
       ...(kind === "feed"
         ? { feed: { source: "rss", ref: "https://example.com/feed.xml", ttlSeconds: 3600 } }
         : {}),

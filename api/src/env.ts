@@ -38,6 +38,29 @@ const Schema = z
     ACCESS_TTL_SECONDS: IntFrom(900, 60, 86_400),
     REFRESH_TTL_SECONDS: IntFrom(30 * 86_400, 3600, 365 * 86_400),
     EVENTS_PER_MINUTE: IntFrom(120, 1, 100_000),
+
+    // ---- feeds ----
+    // Credentials for the two sources that have no anonymous read path. A
+    // missing pair is not a boot failure: a deployment with no Spotify blocks
+    // should not be required to hold Spotify credentials, so the adapter
+    // reports itself unconfigured at refresh time instead.
+    GITHUB_TOKEN: z.string().default(''),
+    SPOTIFY_CLIENT_ID: z.string().default(''),
+    SPOTIFY_CLIENT_SECRET: z.string().default(''),
+    TWITCH_CLIENT_ID: z.string().default(''),
+    TWITCH_CLIENT_SECRET: z.string().default(''),
+    FEED_MAX_ITEMS: IntFrom(8, 1, 50),
+    FEED_TIMEOUT_MS: IntFrom(8_000, 500, 30_000),
+    FEED_MAX_BYTES: IntFrom(1_000_000, 1024, 20_000_000),
+    /** Feed blocks fetched per shard per scheduled run. */
+    FEED_BATCH: IntFrom(25, 1, 200),
+    FEED_CONCURRENCY: IntFrom(4, 1, 20),
+
+    // ---- edge ----
+    // The edge short-circuits rule-free links from the KeyValueStore without
+    // reaching the origin, which also means those clicks are never counted
+    // server-side. `off` keeps every redirect on the origin path.
+    HOT_LINKS: z.enum(['on', 'off']).default('on'),
   })
   .superRefine((v, ctx) => {
     const prod = v.NODE_ENV === 'production';
@@ -112,6 +135,17 @@ function load() {
     accessTtlSeconds: v.ACCESS_TTL_SECONDS,
     refreshTtlSeconds: v.REFRESH_TTL_SECONDS,
     eventsPerMinute: v.EVENTS_PER_MINUTE,
+    githubToken: v.GITHUB_TOKEN,
+    spotifyClientId: v.SPOTIFY_CLIENT_ID,
+    spotifyClientSecret: v.SPOTIFY_CLIENT_SECRET,
+    twitchClientId: v.TWITCH_CLIENT_ID,
+    twitchClientSecret: v.TWITCH_CLIENT_SECRET,
+    feedMaxItems: v.FEED_MAX_ITEMS,
+    feedTimeoutMs: v.FEED_TIMEOUT_MS,
+    feedMaxBytes: v.FEED_MAX_BYTES,
+    feedBatch: v.FEED_BATCH,
+    feedConcurrency: v.FEED_CONCURRENCY,
+    hotLinks: v.HOT_LINKS === 'on',
   };
 }
 

@@ -354,18 +354,15 @@ function toTheme(raw: Record<string, string> | undefined): Theme {
   };
 }
 
-/** `header` is what the renderer has always called `text`: a note, not a link. */
-const RENDERED_KIND: Record<BlockKind, ResolvedBlock["kind"]> = {
-  link: "link",
-  header: "text",
-  embed: "embed",
-  feed: "feed",
-};
-
 export function toResolution(wire: WireResolution): Resolution {
   const blocks: ResolvedBlock[] = wire.blocks.map((b) => ({
     id: b.id,
-    kind: RENDERED_KIND[b.kind] ?? "link",
+    // No translation any more. This used to map `header` to `text`, because
+    // `text` was the only arm the renderer had that produced something other
+    // than a link card — a workaround for the missing `header` arm, and the
+    // reason the renderer's kinds had drifted from the backend's in the first
+    // place. The two vocabularies are the same set now.
+    kind: b.kind,
     label: b.label,
     // The redirector, not the destination: the click has to be counted, and on
     // a page whose target varies by viewer the destination is not a property of

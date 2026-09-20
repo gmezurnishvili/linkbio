@@ -45,11 +45,23 @@ export type Block = {
   feed?: { source: string; ref: string; ttlSeconds: number };
   items?: Array<{ title: string; subtitle?: string; href?: string }>;
   /**
-   * When the feed was last fetched. The refresh index is keyed off this rather
-   * than off `updatedAt`, so editing a block's label no longer pushes its next
-   * refresh a full TTL into the future.
+   * When the feed last came back with items. Shown in the editor, and the thing
+   * a creator actually wants to know: `feedAttemptedAt` moving while this does
+   * not is exactly the shape of a feed that has quietly broken.
    */
   feedRefreshedAt?: number;
+  /**
+   * When the refresher last tried, successfully or not. The refresh index is
+   * keyed off this rather than off `updatedAt`, so editing a block's label no
+   * longer pushes its next refresh a full TTL into the future — and off the
+   * attempt rather than the success, or a failing feed would stay permanently
+   * due and be retried on every single run.
+   */
+  feedAttemptedAt?: number;
+  /** Consecutive failures, which is what the backoff multiplier reads. */
+  feedFailures?: number;
+  /** The last failure, surfaced in the editor so a broken ref is visible. */
+  feedError?: string;
   createdAt: number;
   updatedAt: number;
 };
@@ -95,6 +107,24 @@ export const TOMBSTONE_DAYS = 90;
 
 /** Daily rollups expire; all-time per-block totals do not. */
 export const DAILY_RETENTION_DAYS = 400;
+
+/**
+ * When a feed block is next due.
+ *
+ * The backoff is the reason this is a function rather than an expression at the
+ * two call sites: a feed that 404s has to stop being due every hour, but it
+ * also has to keep trying, because the usual cause is a creator fixing the ref
+ * in a minute's time. Doubling to a 16× ceiling takes an hourly feed to roughly
+ * daily and no further.
+ */
+export const FEED_BACKOFF_CEILING = 16;
+
+export function nextFeedDueAt(b: Pick<Block, 'feed' | 'feedAttemptedAt' | 'feedRefreshedAt' | 'feedFailures'>): number {
+  const ttl = (b.feed?.ttlSeconds ?? 3600) * 1000;
+  const last = b.feedAttemptedAt ?? b.feedRefreshedAt ?? 0;
+  const factor = Math.min(2 ** (b.feedFailures ?? 0), FEED_BACKOFF_CEILING);
+  return last + ttl * factor;
+}
 
 export const REFRESH_SHARDS = 10;
 export const shardFor = (id: string) =>

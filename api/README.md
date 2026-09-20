@@ -92,6 +92,11 @@ same tail rank and write it twice.
 - **Never 301.** The schema only permits 302 and 307 for rule-driven redirects. A browser-cached permanent redirect outlives every TTL this service computes.
 - **Boundaries cause synchronised stampedes.** Every edge location's TTL expires at the same instant. Turn on Origin Shield; add jitter only *after* the boundary, never before.
 - **Don't put the Lambda in a VPC.** Nothing it talks to requires one, and a NAT gateway costs ~$33/month before serving a request.
+- **A hot link is a promise that the origin would have said the same thing.** The edge answers `hot:<handle>/<id>` without evaluating anything, so a block only qualifies while it has no rules, no activity window, an http(s) target, and sits on a published profile. The moment any of that stops being true the key has to go, which is why `publishRouting` sends deletes alongside every publish — and why a deleted block's id is passed in explicitly, since it is gone from `listBlocks` by then.
+- **Hot links are not counted server-side.** A redirect answered at the edge never reaches `/r/`, so `recordEvents` never sees it. The public page's own beacon still fires; a visitor with JavaScript off does not. `HOT_LINKS=off` puts every redirect back on the origin path.
+- **A rename has to move the edge routing with it.** `mask:<handle>` and every `hot:<handle>/…` are keyed by name, and a handle that changes hands carries them to the next owner — a cache-key mask derived from someone else's rules. `publishRouting` takes `previousHandle` for exactly this.
+- **Feeds are pulled on a schedule, never on the render path.** A cache miss is already the slowest thing a visitor can do; putting YouTube in that path turns a third party's outage into a creator's page timing out. The cost is that a new feed block is empty for a few minutes, which the editor says out loud.
+- **A failing feed backs off, and the backoff reads the attempt, not the success.** `nextFeedDueAt` doubles the interval per consecutive failure to a 16× ceiling. Keying the index off `feedRefreshedAt` alone leaves a broken feed permanently due and retried on every single run.
 - **KeyValueStore is 5 MB total, 1 KB per value.** It holds masks and hot links, not data. This design runs out of room around 50–80k profiles using context routing; the exit is Lambda@Edge plus DynamoDB Global Tables on the miss path.
 
 ## Layout
@@ -101,7 +106,8 @@ src/
   app.ts              Hono app, middleware, route mounting
   auth.ts             JWT verification, viewer-context normalization
   rank.ts             Fractional indexing for block order
-  publish.ts          Mask derivation and KeyValueStore publishing
+  publish.ts          Mask + hot-link derivation, KeyValueStore publishing
+  refresher.ts        Scheduled Lambda: fills feed blocks whose TTL elapsed
   domain/schema.ts    Zod schemas — the API contract
   domain/types.ts     Entities and single-table key builders
   db/repo.ts          Repository interface
@@ -109,6 +115,7 @@ src/
   db/memory.ts        Test implementation, same semantics
   routes/             profiles, blocks, public, analytics
   rules/              Rule evaluator and DST-correct boundary math
+  feeds/              Feed adapters, SSRF-safe fetcher, refresh scheduling
 edge/normalize.js     CloudFront viewer-request function
 infra/stack.ts        CDK stack
 ```
@@ -118,6 +125,19 @@ infra/stack.ts        CDK stack
 ```bash
 npm run build         # or build:slim to externalize the SDK (1.5MB -> 300KB)
 npx cdk deploy
+```
+
+`npm run build` produces two bundles: `dist/` for the API and `dist-refresher/`
+for the feed refresher, which the stack schedules every five minutes with
+`reservedConcurrentExecutions: 1`. Two overlapping runs would be harmless — the
+work list is a due-time index and each refresh pushes that time forward before
+anything else — but they would double the rate-limit pressure on YouTube and
+GitHub for nothing.
+
+To see what the refresher would do, without waiting for the schedule:
+
+```bash
+DB_DRIVER=dynamo TABLE_NAME=linkbio npm run refresh:once
 ```
 
 `build:slim` relies on the AWS SDK present in the Node 22 Lambda runtime. It cuts cold start noticeably but gives up version pinning — if the runtime's SDK drifts, you find out in production. Bundle fully unless cold start is measurably hurting.

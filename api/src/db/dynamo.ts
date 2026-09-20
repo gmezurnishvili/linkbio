@@ -4,7 +4,7 @@ import {
   TransactWriteCommand, UpdateCommand, DeleteCommand, BatchWriteCommand,
 } from '@aws-sdk/lib-dynamodb';
 import type { Block, DailyStat, Profile, User, RefreshRecord } from '../domain/types.ts';
-import { K, shardFor, TOMBSTONE_DAYS, DAILY_RETENTION_DAYS } from '../domain/types.ts';
+import { K, nextFeedDueAt, shardFor, TOMBSTONE_DAYS, DAILY_RETENTION_DAYS } from '../domain/types.ts';
 import type { TClickEvent } from '../domain/schema.ts';
 import {
   ConflictError, NotFoundError, VersionConflictError,
@@ -337,9 +337,9 @@ export class DynamoRepo implements Repo {
         ...K.block(block.profileId, block.rank, block.id),
         type: 'block',
         ...block,
-        ...(block.kind === 'feed'
-          ? K.gsi2Refresh(shardFor(block.id), (block.feedRefreshedAt ?? 0) + (block.feed?.ttlSeconds ?? 3600) * 1000)
-          : {}),
+        // Sparse by omission: a non-feed block writes no GSI2 key at all, so
+        // the refresh index holds only rows the refresher could act on.
+        ...(block.kind === 'feed' ? K.gsi2Refresh(shardFor(block.id), nextFeedDueAt(block)) : {}),
       },
     }));
     return block;

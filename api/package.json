@@ -7,8 +7,10 @@
     "start": "node --env-file-if-exists=.env --experimental-strip-types src/local.ts",
     "test": "node --experimental-strip-types --test \"test/*.test.ts\"",
     "typecheck": "tsc --noEmit",
-    "build": "esbuild src/lambda.ts --bundle --platform=node --target=node22 --format=esm --outfile=dist/index.mjs --sourcemap --banner:js=\"import{createRequire}from'module';const require=createRequire(import.meta.url);\"",
-    "build:slim": "esbuild src/lambda.ts --bundle --platform=node --target=node22 --format=esm --outfile=dist/index.mjs --sourcemap --banner:js=\"import{createRequire}from'module';const require=createRequire(import.meta.url);\" --external:@aws-sdk/client-dynamodb --external:@aws-sdk/lib-dynamodb"
+    "build": "esbuild src/lambda.ts --bundle --platform=node --target=node22 --format=esm --outfile=dist/index.mjs --sourcemap --banner:js=\"import{createRequire}from'module';const require=createRequire(import.meta.url);\" && npm run build:refresher",
+    "build:slim": "esbuild src/lambda.ts --bundle --platform=node --target=node22 --format=esm --outfile=dist/index.mjs --sourcemap --banner:js=\"import{createRequire}from'module';const require=createRequire(import.meta.url);\" --external:@aws-sdk/client-dynamodb --external:@aws-sdk/lib-dynamodb",
+    "build:refresher": "esbuild src/refresher.ts --bundle --platform=node --target=node22 --format=esm --outfile=dist-refresher/index.mjs --sourcemap --banner:js=\"import{createRequire}from'module';const require=createRequire(import.meta.url);\"",
+    "refresh:once": "node --env-file-if-exists=.env --experimental-strip-types scripts/refresh-once.ts"
   },
   "dependencies": {
     "@aws-sdk/client-cloudfront-keyvaluestore": "^3.700.0",

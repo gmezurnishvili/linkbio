@@ -78,6 +78,13 @@ export async function GET(
       "connect-src https:",
       "form-action 'none'",
       "frame-ancestors 'self'",
+      // Exactly the providers this page framed, and no others. `default-src
+      // 'none'` means an omitted host is a player that never loads, so the
+      // renderer reports back what it embedded rather than the directive being
+      // written against the allowlist as a whole.
+      page.frameHosts.length
+        ? `frame-src ${page.frameHosts.map((h) => `https://${h}`).join(" ")}`
+        : "frame-src 'none'",
     ].join("; "),
     // Useful when debugging a variant by hand; strip it in production if you
     // would rather not publish how the key is built.

@@ -2,8 +2,10 @@
 
 import { useEffect, useState } from "react";
 import type { Block } from "@/lib/api/types";
+import { FEED_SOURCES, feedRefHint, feedRefProblem } from "@/lib/feeds";
+import { resolveEmbed } from "@/lib/site/embed";
 import { describeRule } from "@/lib/rules/language";
-import { Button, Field, Input, Sheet, Toggle } from "@/components/ui/primitives";
+import { Button, Field, Input, Select, Sheet, Toggle } from "@/components/ui/primitives";
 import { RuleBuilder, draftFrom, emptyDraft, normalise, type RuleDraft } from "./rule-builder";
 import { nextPriority } from "./rules-library";
 import { orderedRules, useProfile } from "./profile-store";
@@ -12,6 +14,7 @@ export function BlockSheet({ block, onClose }: { block: Block | null; onClose: (
   const { state, ops } = useProfile();
   const [label, setLabel] = useState("");
   const [url, setUrl] = useState("");
+  const [feed, setFeed] = useState<NonNullable<Block["feed"]>>(EMPTY_FEED);
   const [draft, setDraft] = useState<RuleDraft | null>(null);
 
   const rules = orderedRules(block?.rules ?? []);
@@ -20,6 +23,7 @@ export function BlockSheet({ block, onClose }: { block: Block | null; onClose: (
     if (!block) return;
     setLabel(block.label);
     setUrl(block.url ?? "");
+    setFeed(block.feed ?? EMPTY_FEED);
     setDraft(null);
   }, [block?.id]);
 
@@ -27,13 +31,20 @@ export function BlockSheet({ block, onClose }: { block: Block | null; onClose: (
   const busy = state.pending.has(block.id);
   const savingRules = state.pending.has(`${block.id}:rules`);
 
+  const refProblem = block?.kind === "feed" ? feedRefProblem(feed.source, feed.ref) : null;
+  // An embed whose URL no provider matches still renders — as a link card — so
+  // this is a note, not an error.
+  const embedFallback = block?.kind === "embed" && url.trim() !== "" && !resolveEmbed(url);
+
   function save() {
     void ops.updateBlock(block!.id, {
       label,
-      // Only a link carries a destination, and the backend refuses a link
-      // without one — `checkBlockShape` validates the merged block, so clearing
-      // it on a PATCH is a 400 rather than a silent 404 at the redirector.
-      ...(block!.kind === "link" ? { url } : {}),
+      // A link is refused without a destination and an embed is useless without
+      // one, so both send it. `checkBlockShape` validates the merged block, so
+      // clearing a link's target on a PATCH is a 400 rather than a silent 404
+      // at the redirector later.
+      ...(block!.kind === "link" || block!.kind === "embed" ? { url } : {}),
+      ...(block!.kind === "feed" ? { feed } : {}),
     });
   }
 
@@ -67,7 +78,7 @@ export function BlockSheet({ block, onClose }: { block: Block | null; onClose: (
       footer={
         draft ? null : (
           <>
-            <Button variant="primary" onClick={save} disabled={busy}>
+            <Button variant="primary" onClick={save} disabled={busy || Boolean(refProblem)}>
               {busy ? "Saving" : "Save changes"}
             </Button>
             <Button
@@ -100,10 +111,14 @@ export function BlockSheet({ block, onClose }: { block: Block | null; onClose: (
             <Input value={label} onChange={(e) => setLabel(e.target.value)} />
           </Field>
 
-          {block.kind === "link" && (
+          {(block.kind === "link" || block.kind === "embed") && (
             <Field
-              label="Destination"
-              hint="Rules can send some visitors somewhere else without changing this."
+              label={block.kind === "embed" ? "What to embed" : "Destination"}
+              hint={
+                block.kind === "embed"
+                  ? "A share link from YouTube, Spotify, SoundCloud, Vimeo or Apple Music."
+                  : "Rules can send some visitors somewhere else without changing this."
+              }
             >
               <Input
                 value={url}
@@ -111,23 +126,56 @@ export function BlockSheet({ block, onClose }: { block: Block | null; onClose: (
                 placeholder="https://"
                 inputMode="url"
               />
+              {embedFallback && (
+                <p className="mt-1.5 text-[0.8125rem] text-muted">
+                  No player for that link — it will render as an ordinary link card.
+                </p>
+              )}
             </Field>
           )}
 
-          {block.kind === "feed" && block.feed && (
-            <div className="rounded-desk bg-sunk px-3 py-2.5 text-[0.8125rem]">
-              <p>
-                Filled from <span className="font-mono">{block.feed.source}</span> ·{" "}
-                <span className="font-mono">{block.feed.ref}</span>
-              </p>
-              <p className="mt-1 text-muted">
-                {block.items?.length ?? 0} items, refreshing every{" "}
-                {Math.round(block.feed.ttlSeconds / 60)} min
-                {block.feedRefreshedAt
-                  ? `, last ${new Date(block.feedRefreshedAt).toLocaleString()}`
-                  : ", never fetched"}
-              </p>
-            </div>
+          {block.kind === "feed" && (
+            <>
+              <Field label="Source">
+                <Select
+                  value={feed.source}
+                  onChange={(e) => setFeed({ ...feed, source: e.target.value })}
+                >
+                  {FEED_SOURCES.map((sourceId) => (
+                    <option key={sourceId} value={sourceId}>
+                      {sourceId}
+                    </option>
+                  ))}
+                </Select>
+              </Field>
+
+              <Field label="What to pull" hint={feedRefHint(feed.source)} error={refProblem ?? undefined}>
+                <Input value={feed.ref} onChange={(e) => setFeed({ ...feed, ref: e.target.value })} />
+              </Field>
+
+              <Field
+                label="Refresh every"
+                hint="The page itself is cached for up to five minutes on top of this."
+              >
+                <Select
+                  value={String(feed.ttlSeconds)}
+                  onChange={(e) => setFeed({ ...feed, ttlSeconds: Number(e.target.value) })}
+                >
+                  {[
+                    [900, "15 minutes"],
+                    [3600, "hour"],
+                    [21600, "6 hours"],
+                    [86400, "day"],
+                  ].map(([seconds, human]) => (
+                    <option key={seconds} value={seconds}>
+                      {human}
+                    </option>
+                  ))}
+                </Select>
+              </Field>
+
+              <FeedStatus block={block} />
+            </>
           )}
 
           <div className="flex flex-col gap-3 border-t border-line pt-4">
@@ -177,5 +225,45 @@ export function BlockSheet({ block, onClose }: { block: Block | null; onClose: (
         </div>
       )}
     </Sheet>
+  );
+}
+
+const EMPTY_FEED = { source: "rss", ref: "", ttlSeconds: 3600 };
+
+/**
+ * What the refresher last did with this block.
+ *
+ * A feed block with no items renders as nothing at all on the public page, and
+ * from the editor that is indistinguishable from the block not having saved.
+ * This is the only place the difference is visible, so it says which it is.
+ */
+function FeedStatus({ block }: { block: Block }) {
+  const count = block.items?.length ?? 0;
+  const fetched = block.feedRefreshedAt
+    ? new Date(block.feedRefreshedAt).toLocaleString()
+    : null;
+
+  return (
+    <div className="rounded-desk bg-sunk px-3 py-2.5 text-[0.8125rem]">
+      {block.feedError ? (
+        <>
+          <p className="text-alert">Last refresh failed</p>
+          <p className="mt-1 text-muted">{block.feedError}</p>
+          {count > 0 && (
+            <p className="mt-1 text-muted">
+              Still showing {count} item{count === 1 ? "" : "s"} from {fetched}.
+            </p>
+          )}
+        </>
+      ) : fetched ? (
+        <p className="text-muted">
+          {count} item{count === 1 ? "" : "s"}, fetched {fetched}.
+        </p>
+      ) : (
+        <p className="text-muted">
+          Not fetched yet. Feeds fill in on a schedule, so a new block stays empty for a few minutes.
+        </p>
+      )}
+    </div>
   );
 }

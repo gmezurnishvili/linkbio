@@ -1,4 +1,181 @@
-# linkbio — what changed
+# linkbio — feeds, hot links, and the block-kind vocabulary
+
+Three of the four gaps from the audit. Analytics is deliberately left out of the
+MVP; the backend still records events, there is still no dashboard reading them.
+
+**Gates:** api `npm test` 397 passing (was 331), `npm run typecheck` clean,
+`npx cdk synth` succeeds, both Lambda bundles build. web `npx vitest run` 106
+passing (was 86), `npx tsc --noEmit` clean, `next build` passes. The full
+header → embed → feed → link page was rendered against the real backend, not
+the mock.
+
+---
+
+## 1. Feed blocks now have something behind them
+
+`dueForRefresh`, the GSI2 index, `feed.ttlSeconds` and the `items` field have
+existed since the schema was written. Nothing ever walked them, so every feed
+block a creator added rendered as nothing at all — `feedBlock` returns an empty
+string for zero items, which is why it looked like the block had failed to save
+rather than like a feature that was not built.
+
+**`src/feeds/xml.ts`** — RSS 2.0 and Atom, by hand, no dependency. Tolerance is
+a deliberate property rather than whatever a library happens to do this major
+version: CDATA is text, unknown entities are left verbatim rather than replaced
+with a placeholder that would corrupt a title containing `&something;`, a
+mismatched close tag unwinds to the matching open if there is one, an
+unterminated tag ends the document instead of throwing. A feed that is 90%
+well-formed yields 90% of its items.
+
+**`src/feeds/fetch.ts`** — the only route to the network. `SafeUrl` validates
+what a creator types, which is necessary and not sufficient: `http://evil.test/`
+passes and then 302s to the instance metadata service. So redirects are followed
+by hand and every hop is re-validated, the body is read through a byte cap
+rather than buffered and sliced, and adapters that talk to a known API pin the
+host they think they are calling.
+
+**`src/feeds/adapters.ts`** — all five sources. YouTube goes through its
+per-channel Atom feed, which needs no key and has no quota; the cost is that an
+`@handle` cannot be resolved without the Data API or a page scrape, so that case
+returns the fix rather than an empty block. GitHub reads releases for
+`owner/repo` and recently-pushed repos for a username. Spotify and Twitch use
+client-credentials tokens cached per process.
+
+Two failure kinds are distinguished, because they need opposite handling.
+`FeedRefUnusable` is the creator's ref being wrong — retrying hourly forever
+burns quota and will never succeed, so it backs off hard and the message reaches
+the editor. `FeedNotConfigured` is a missing operator credential, which the
+creator can do nothing about; that one does not touch their failure count and
+does not put an error on their block blaming them for it.
+
+**Backoff.** I added `feedAttemptedAt`, `feedFailures` and `feedError`, and
+moved the due-time calculation into `nextFeedDueAt` in `domain/types.ts` so both
+repositories schedule identically. The interval doubles per consecutive failure
+to a 16× ceiling. Keying the index off `feedRefreshedAt` alone — which is what
+it did — leaves a broken feed permanently due and retried on every single run.
+
+**`src/refresher.ts`** — its own scheduled Lambda, not a route on the API. It
+waits on five third parties so it needs six times the API's timeout, and a feed
+that hangs must not be able to eat the concurrency a creator's dashboard is
+using. Idempotent by construction, so EventBridge firing twice duplicates a
+fetch and corrupts nothing.
+
+Feeds are pulled on a schedule and never on the render path. A cache miss is
+already the slowest thing a visitor can do; putting YouTube in that path turns a
+third party's outage into a creator's page timing out. The cost is that a new
+feed block is empty for a few minutes, so the editor now says so.
+
+Two conformance bugs fell out of this. `MemoryRepo.dueForRefresh` ignored the
+shard argument, so a refresher walking ten shards processed every block ten
+times against memory and once against DynamoDB — and only one of those was under
+test. And the document client is configured with `removeUndefinedValues`, so
+clearing `feedError` deletes the attribute in production while memory kept the
+key with an undefined value; `MemoryRepo.putBlock` now drops them the same way.
+
+## 2. The `hot:` key path has a writer
+
+`edge/normalize.js` has always read `hot:<handle>/<slug>` to answer a static
+redirect without touching the origin. Nothing wrote it, so the branch was
+unreachable.
+
+`publish.ts` is now `publishRouting`, deriving both key families and sending
+puts and deletes in one `UpdateKeys` call — so the edge never observes a state
+where the mask has moved to a renamed handle while the old hot links still
+answer under the old one.
+
+A block qualifies only while it has no rules, no activity window, an http(s)
+target, and sits on a published profile. Each of those is load-bearing: the edge
+serves a constant where the origin computes a variable, which is the same class
+of bug as the old positional `x-ctx` decoding and cached just as hard. A draft
+profile gets no entries at all, since `/r/` 404s for one and a hot link would
+publish a page its owner never published.
+
+Stale keys are **derived rather than remembered**. Storing the last published
+key list on the profile would mean a second write after every mutation, and that
+write bumps the version the client is holding as its `If-Match`. Deriving costs
+a handful of idempotent deletes and keeps the version meaning one thing. A
+deleted block's id is passed in explicitly, because it is gone from `listBlocks`
+by the time the publish runs.
+
+**This caught a bug that predates hot links.** A handle rename left `mask:<old>`
+behind entirely — the next creator to claim that handle inherited a cache-key
+mask derived from someone else's rules. Neither handle-claim route republished
+at all. `profiles.patch` did not either, which is worse than it sounds: the mask
+value carries the profile version, so editing a bio left the edge announcing a
+stale version, the origin read that as a stale key, and the page silently
+stopped caching.
+
+I also changed the wire format to `<status>|<url>`, split on the first
+separator. A URL may legally contain `|` in its query and the old split
+truncated exactly those targets. The edge now also skips the lookup entirely
+when the slug is empty, which was a KeyValueStore read on every page view for a
+key the API never writes.
+
+**One trade-off to be aware of:** a redirect answered at the edge never reaches
+`/r/`, so it is never counted server-side. The page's own beacon still fires; a
+visitor with JavaScript off is invisible. `HOT_LINKS=off` puts everything back
+on the origin path. Given analytics is out of the MVP this seemed like the right
+default, but it is a one-line change if you disagree.
+
+## 3. Block kinds are one vocabulary again
+
+The backend's `BLOCK_KINDS` is `link | header | embed | feed`. The renderer
+switched on `feed`, `text`, `gate`, then fell through to the link renderer — so
+`header` rendered as a clickable card with no destination and an empty hint
+line, `embed` rendered as a plain link, and the `text` and `gate` arms were
+unreachable. The client had been papering over the first of those by translating
+`header` to `text` on the way through.
+
+- `header` is now an `<h2 class="section">`. A section divider in a list of
+  links is the reason the kind exists, and a screen-reader user navigating by
+  heading is the reason it is a heading rather than a styled paragraph.
+- `embed` renders a player, from an allowlist: YouTube (via `-nocookie`),
+  Spotify, SoundCloud, Vimeo, Apple Music. Anything unrecognised stays a link
+  card, because losing the block entirely because the creator pasted a URL from
+  a service with no player is worse.
+- `text` and `gate` are gone, along with the `RenderedBlockKind` type that was
+  wider than `BlockKind` — that widening is what let the dead arms sit there
+  without the compiler saying anything.
+
+The CSP is `default-src 'none'`, so `frame-src` matters. `renderProfileDocument`
+returns the hosts it actually framed and the route handler names exactly those —
+a page with one YouTube embed is not permitted to frame Spotify. The iframes are
+deliberately **not** sandboxed: a cross-origin frame is already isolated, and
+the attributes a player needs to work (`allow-scripts allow-same-origin`) are
+precisely the pair that makes `sandbox` a no-op. The allowlist plus `frame-src`
+is the control that holds. Embeds also carry no `data-block`, since a pointer
+landing on an iframe is a play or a scrub, not a click-through.
+
+**Editor.** Feed blocks were displaying their config read-only, so a feed could
+be created but never corrected; embeds had no URL field at all, because the
+destination input was gated on `kind === "link"`. Both are editable now, with
+`lib/feeds.ts` giving per-source hints and a shape check on the ref — the
+`@handle` case especially, which looks completely reasonable and would otherwise
+fail minutes later on a block that had already saved. That file checks shape and
+claims nothing about validity: the adapters are the authority, and a client copy
+that drifts is worse than no client check, which is the lesson
+`lib/rules/schema.ts` already has in its header.
+
+**Also fixed:** `sameAs` in the JSON-LD was mapping `b.href`, which is
+`/r/:handle/:id` — so every entry was a self-reference back into this site,
+which is the opposite of what `sameAs` is for.
+
+## Still not done
+
+- Analytics, by your call. Backend records, nothing reads.
+- The analytics UTC-day bucketing, which splits the day for a creator outside
+  UTC±0. Waiting on the dashboard that would show it.
+- `next build` was verified here with the Google Fonts import stubbed, because
+  this sandbox has no egress to `fonts.googleapis.com`. Real fonts are restored
+  in the diff and `tsc` is clean against them, but run a production build before
+  you ship.
+- Spotify's artist endpoint requires a `market` and has no global variant, so
+  the track list is the US one for every visitor. A per-country list would need
+  geo in the cache key for a block whose rules never asked for it.
+
+---
+
+# Previously — the audit fixes
 
 All of it is in your working copy. Nothing is committed; `git status` shows 53
 modified and 26 new files. `git diff` is the review.

@@ -227,12 +227,6 @@ export interface RuleWarning {
  */
 export type BlockKind = "link" | "header" | "embed" | "feed";
 
-/**
- * What the public renderer will switch on. A superset of `BlockKind`, because
- * lib/site/render.ts still has arms for the two kinds above and reaching them
- * is how a `header` gets rendered as a note rather than as a bare link.
- */
-export type RenderedBlockKind = BlockKind | "gate" | "text";
 
 export interface Block {
   id: string;
@@ -251,8 +245,14 @@ export interface Block {
   activeUntil?: number;
   /** kind "feed": which adapter fills it, what from, and how often. */
   feed?: { source: string; ref: string; ttlSeconds: number };
-  /** Epoch ms of the last successful feed fetch. */
+  /** Epoch ms of the last fetch that returned items. */
   feedRefreshedAt?: number;
+  /** Epoch ms of the last attempt, successful or not. Drives the backoff. */
+  feedAttemptedAt?: number;
+  /** Consecutive failures; the refresher doubles the interval per failure. */
+  feedFailures?: number;
+  /** Why the last attempt failed, shown in the editor. */
+  feedError?: string;
   items?: { title: string; subtitle?: string; href?: string }[];
 }
 
@@ -322,7 +322,13 @@ export interface VisitorContext {
 
 export interface ResolvedBlock {
   id: string;
-  kind: RenderedBlockKind;
+  /**
+   * The same four kinds the editor has. There was a wider `RenderedBlockKind`
+   * here covering `gate` and `text`, which the renderer had arms for and the
+   * backend could not produce — the widened type is what let those arms sit
+   * unreachable without the compiler saying so.
+   */
+  kind: BlockKind;
   label: string;
   href?: string;
   /**
@@ -333,8 +339,6 @@ export interface ResolvedBlock {
    */
   target?: string;
   slug?: string;
-  /** No backend counterpart; never populated. The renderer still has an arm for it. */
-  gate?: { type: "email" | "code" | "referrer"; prompt: string };
   items?: { title: string; subtitle?: string; href?: string }[];
 }
 
