@@ -1,3 +1,10 @@
+// CloudFront KeyValueStore signs with SigV4a, which the JS SDK does not ship in
+// the client. The implementation registers itself into a container on import,
+// so this side-effect import is the whole wiring — remove it and every call to
+// the store throws "Neither CRT nor JS SigV4a implementation is available"
+// before a request is ever sent. Both this package and `@smithy/signature-v4a`
+// declare `sideEffects: true`, so esbuild keeps the import when bundling.
+import '@aws-sdk/signature-v4a';
 import {
   CloudFrontKeyValueStoreClient, DescribeKeyValueStoreCommand, UpdateKeysCommand,
 } from '@aws-sdk/client-cloudfront-keyvaluestore';
