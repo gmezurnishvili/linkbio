@@ -200,13 +200,16 @@ export class DynamoRepo implements Repo {
   }
 
   async updateProfile(id: string, patch: Partial<Profile>, expectedVersion?: number) {
-    const { expr, names, values } = buildUpdate(patch, ['id', 'userId', 'createdAt', 'version']);
+    // `updatedAt` is owned by this method (`#ua = :now` below). Letting a patch
+    // also set it would put two SET actions on the same path, which DynamoDB
+    // rejects outright as overlapping document paths.
+    const { expr, names, values } = buildUpdate(patch, ['id', 'userId', 'createdAt', 'updatedAt', 'version']);
     const guarded = expectedVersion !== undefined;
     try {
       const r = await doc.send(new UpdateCommand({
         TableName: T,
         Key: K.profile(id),
-        UpdateExpression: `SET ${expr.join(', ')}, #v = #v + :one, #ua = :now`,
+        UpdateExpression: `SET ${[...expr, '#v = #v + :one', '#ua = :now'].join(', ')}`,
         ConditionExpression: guarded
           ? 'attribute_exists(PK) AND #v = :ev'
           : 'attribute_exists(PK)',
@@ -546,7 +549,8 @@ function buildUpdate(patch: Record<string, unknown>, skip: string[]) {
     expr.push(`#k${i} = :v${i}`);
     i++;
   }
-  if (!expr.length) { names['#noop'] = 'updatedAt'; values[':noop'] = Date.now(); expr.push('#noop = :noop'); }
+  // No noop filler: the only caller always appends its own version and
+  // `updatedAt` actions, so an empty patch still yields a valid expression.
   return { expr, names, values };
 }
 
