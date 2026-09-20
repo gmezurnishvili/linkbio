@@ -268,6 +268,8 @@ Passed as CDK context, e.g. `npx cdk deploy -c corsOrigins=https://example.com`.
 | Context | Effect |
 | --- | --- |
 | `originSecret` | The shared secret CloudFront presents to both origins. Prefer the `LINKBIO_ORIGIN_SECRET` environment variable; this context key exists for CI systems that only pass arguments. Omitted, the function URLs answer anyone who finds them, and synth says so. |
+| `domain` | The apex of a custom domain, e.g. `chamelink.app`. On its own it creates a public hosted zone and nothing else; that is step 1 of the section above. `LINKBIO_DOMAIN` does the same. |
+| `attachDomain` | `1` issues the certificate, puts `domain` on the distribution and points the zone at it. **Only once the registrar's delegation resolves** — before that, ACM cannot validate and the deploy hangs and then rolls back. `LINKBIO_ATTACH_DOMAIN` does the same. |
 | `refresherReservedConcurrency` | Concurrent executions reserved for the feed refresher. Off by default, because a reservation must leave 10 unreserved in the account and a new account's whole limit is 10. Set it to `1` once that has been raised, to stop two refresher runs overlapping. |
 | `corsOrigins` | Comma-separated exact browser origins allowed to call the API cross-origin. The dashboard is same-origin and needs nothing here; the beacon is a simple request that never preflights. Usually empty. |
 | `jwksUrl`, `jwtIssuer`, `jwtAudience` | Hand identity to an external issuer instead of the API's own tokens. `jwtAudience` is required with `jwksUrl` — without it, every token that issuer has ever minted is accepted. |
@@ -297,6 +299,143 @@ aws secretsmanager create-secret --name linkbio/github \
 YouTube and RSS need nothing. GitHub works unauthenticated at 60 requests an
 hour **per IP, shared across every block in the fleet** — fine for a demo, not
 for real traffic.
+
+---
+
+## Custom domain
+
+`chamelink.app`, registered at an external registrar with its DNS moved to
+Route 53. **Three steps, and the middle one is a wait at the registrar that
+nothing in AWS can shorten.**
+
+The stack takes the domain in two halves for exactly that reason. ACM validates
+a DNS challenge by resolving it over the public internet, so the validation
+record CDK writes into the hosted zone counts for nothing until the registrar
+has been told to delegate the domain to that zone. Ask for the certificate
+before then and CloudFormation does not fail fast: it sits in
+`CREATE_IN_PROGRESS` asking resolvers that still answer with the registrar's own
+nameservers, until validation times out, and then rolls the whole update back —
+taking the distribution's alternate domain names with it.
+
+### 1. Create the hosted zone
+
+Nothing is serving from it yet, so this changes nothing a visitor can see.
+
+```powershell
+cd api
+$env:LINKBIO_ORIGIN_SECRET = "<the same secret as every other deploy>"
+npx cdk deploy -c domain=chamelink.app
+```
+
+The secret is not optional here. It is a stack property, so a deploy without it
+removes the custom origin header from CloudFront while both Lambdas still
+require it — which is a few minutes of 403s on everything, for a deploy that was
+meant to add a DNS zone.
+
+No rebuild is needed: this touches the stack, not the bundles, and the freshness
+guard compares the artifacts against `src`, not against `infra`.
+
+Two new outputs:
+
+```
+Linkbio.HostedZoneId = Z0123456789ABCDEFGHIJ
+Linkbio.Nameservers  = ns-1.awsdns-00.com, ns-2.awsdns-00.net, …
+```
+
+### 2. Delegate the domain at the registrar
+
+In the registrar's control panel, replace the nameservers for `chamelink.app`
+with those four. This is the *nameserver* setting, not an NS record added inside
+the registrar's own DNS editor — adding records there instead leaves the zone
+authoritative in two places, and ACM will read the wrong one.
+
+Then wait, and check with a resolver that is neither the registrar's nor your
+own cache:
+
+```powershell
+Resolve-DnsName chamelink.app -Type NS -Server 8.8.8.8
+```
+
+Until that answers with the four `awsdns` names, step 3 cannot succeed. It is
+usually minutes; the TLD's own TTL can make it hours. `.app` is a Google
+registry TLD and propagates quickly, but the registrar's update queue is its
+own variable.
+
+### 3. Issue the certificate and move the site onto the name
+
+```powershell
+cd api
+$env:SITE_ORIGIN           = "https://chamelink.app"
+$env:LINKBIO_ORIGIN_SECRET = "<the same secret again>"
+$env:LINKBIO_DOMAIN        = "chamelink.app"
+$env:LINKBIO_ATTACH_DOMAIN = "1"
+npm run deploy
+```
+
+Environment variables rather than `-c domain=… -c attachDomain=1`, for the same
+reason the secret is one: `npm run deploy -- -c …` does not survive PowerShell
+5.1. The context keys work anywhere the shell passes them through, and
+`npx cdk deploy -c domain=chamelink.app -c attachDomain=1` is the equivalent
+once the bundles are built.
+
+`SITE_ORIGIN` changes here and it is a **build-time** value, which is why this
+step runs the full `npm run deploy` rather than `cdk deploy` alone. The bundle
+is what carries the canonical URL, the JSON-LD `@id`, `robots.txt` and the
+editor's preview origin.
+
+This deploy takes longer than the others — ACM validation and two CloudFront
+distributions propagating, so fifteen to thirty minutes is normal.
+
+What it creates: the certificate (apex + `www`, DNS-validated in the zone),
+`chamelink.app` as an alternate domain name on the distribution, A and AAAA
+alias records at the apex, and a second, tiny distribution whose only job is to
+301 `www.chamelink.app` to the apex, with its own A and AAAA records.
+
+### 4. Verify
+
+```bash
+curl -s https://chamelink.app/health                      # {"ok":true,…}
+curl -sI https://www.chamelink.app/giorgi?utm_source=x    # 301 → https://chamelink.app/giorgi?utm_source=x
+dig +short chamelink.app                                  # CloudFront addresses
+dig +short AAAA chamelink.app                             # and on v6
+```
+
+Then, in a browser: sign in at `https://chamelink.app/login`, and in DevTools →
+Application → Cookies confirm the session cookies are named `__Host-lc_at` and
+`__Host-lc_rt`. That path has existed since the beginning and has never run
+against a real apex domain, which is where its point lies — a `__Host-` cookie
+is domain-less, so nothing on a sibling subdomain can overwrite the session.
+
+Add a block afterwards. The publish queue writes the edge store, and this is the
+first deploy where the hostname in a published route is the real one.
+
+### What changes for the old `*.cloudfront.net` name
+
+It keeps serving — it is the same distribution, and the alternate domain name is
+an addition. Two differences worth knowing:
+
+- Canonical URLs, JSON-LD and `robots.txt` now say `chamelink.app` whichever
+  hostname served them. That is the intent; it is also why the CloudFront name
+  should stop being used for anything real.
+- Writes still work there in any browser that sends `Sec-Fetch-Site`, which
+  `isSameOrigin` prefers. In a browser old enough not to send it, the fallback
+  compares `Origin` against the baked `SITE_ORIGIN` and a write on the
+  CloudFront name is refused. Not worth fixing; worth recognising if a write
+  fails on the old hostname after the cutover.
+
+`.app` is on the HSTS preload list, so every browser reaches it over HTTPS on
+the first request and there is no plain-http fallback to test. Anything that
+goes wrong with the certificate is a hard failure at the TLS handshake, not a
+degraded page.
+
+### Undoing it
+
+`-c attachDomain` unset on the next deploy removes the alternate domain name,
+the records and the `www` distribution, and the site answers on the CloudFront
+name again — which is a DNS change, so a browser that has cached the apex
+records will keep trying for their TTL. The hosted zone is `RETAIN`: destroying
+the stack leaves it, and its nameservers, alone. Deleting the zone by hand mints
+four new nameservers on the way back and means a second trip to the registrar.
 
 ---
 
