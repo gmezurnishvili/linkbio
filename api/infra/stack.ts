@@ -176,11 +176,16 @@ export class LinkbioStack extends Stack {
     });
 
     table.grantReadWriteData(api);
+    // `UpdateKeys`, not `PutKey`/`DeleteKey`. The batch API is its own IAM
+    // action, and it is the only one `publish.ts` ever calls — puts and deletes
+    // must land in one all-or-nothing call or the edge can see a half-published
+    // profile. Granting the single-key actions instead denied every publish,
+    // which surfaced as a 500 on every block create, not as a permissions
+    // error, because the publish is downstream of the write that succeeded.
     api.addToRolePolicy(new iam.PolicyStatement({
       actions: [
         'cloudfront-keyvaluestore:DescribeKeyValueStore',
-        'cloudfront-keyvaluestore:PutKey',
-        'cloudfront-keyvaluestore:DeleteKey',
+        'cloudfront-keyvaluestore:UpdateKeys',
       ],
       resources: [kvs.keyValueStoreArn],
     }));
