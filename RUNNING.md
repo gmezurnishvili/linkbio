@@ -1,5 +1,8 @@
 # Running linkbio locally
 
+> Deploying to AWS is a different document: **`DEPLOYING.md`**. This one is the
+> local loop.
+
 Your machine: Node v22.23.2, npm 10.9.8, Windows. Both are fine — nothing below
 needs a version bump.
 

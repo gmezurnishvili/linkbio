@@ -32,6 +32,13 @@ const Schema = z
     // Comma-separated exact origins. `*` is accepted but only outside
     // production, so a development convenience cannot ship by accident.
     CORS_ORIGINS: z.string().default(''),
+    /**
+     * Shared secret CloudFront presents as `x-origin-secret`. Empty disables
+     * the check, which is what every local run and every test does; set, it is
+     * the only thing keeping the Lambda function URL from being a way around
+     * the WAF.
+     */
+    ORIGIN_SECRET: z.string().default(''),
     MAX_BLOCKS: IntFrom(200),
     MAX_RULES: IntFrom(20, 1, 200),
     MAX_BODY_BYTES: IntFrom(256 * 1024, 1024, 8 * 1024 * 1024),
@@ -129,6 +136,7 @@ function load() {
     driver: v.DB_DRIVER,
     isProduction: v.NODE_ENV === 'production',
     corsOrigins: v.CORS_ORIGINS.split(',').map((s) => s.trim()).filter(Boolean),
+    originSecret: v.ORIGIN_SECRET,
     maxBlocks: v.MAX_BLOCKS,
     maxRules: v.MAX_RULES,
     maxBodyBytes: v.MAX_BODY_BYTES,

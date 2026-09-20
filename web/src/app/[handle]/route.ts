@@ -1,8 +1,10 @@
 import { createHash } from "node:crypto";
-import { api } from "@/lib/api/client";
-import { ApiError, type VisitorContext } from "@/lib/api/types";
+import { api, toWireContext } from "@/lib/api/client";
+import { ApiError, type VisitorContext, type WireVisitorContext } from "@/lib/api/types";
 import { isReserved, isValidHandle } from "@/lib/handles";
 import { cacheControlFor, visitorContextFromHeaders } from "@/lib/context/visitor";
+import { parseEdgeContext } from "@/lib/context/edge-ctx";
+import { publicOrigin } from "@/lib/site/public-origin";
 import { renderProfileDocument, varyHeader } from "@/lib/site/render";
 
 /**
@@ -30,7 +32,28 @@ export async function GET(
   if (isReserved(handle)) return notFound();
   if (!isValidHandle(handle)) return notFound();
 
-  const context = visitorContextFromHeaders(request.headers);
+  /**
+   * When the request came through CloudFront, `x-ctx` *is* the cache key, and
+   * the answer has to be a function of it and nothing else. Re-deriving the
+   * context from the raw viewer headers would let this page vary on a dimension
+   * the key does not cover, and the variant it produced would then be replayed
+   * from cache to every visitor who differs only in that dimension.
+   *
+   * Without the header the request did not come through the edge — `next dev`,
+   * or a direct origin hit — so nothing is cached on our behalf and every
+   * dimension is free to come from the headers.
+   */
+  const edge = parseEdgeContext(request.headers.get("x-ctx"));
+  const context: VisitorContext = edge
+    ? {
+        geo: edge.context.geo,
+        device: edge.context.device,
+        referrer: edge.context.referrer,
+        language: edge.context.lang,
+        webview: edge.context.webview,
+        at: new Date().toISOString(),
+      }
+    : visitorContextFromHeaders(request.headers);
 
   let resolution;
   try {
@@ -50,17 +73,26 @@ export async function GET(
     });
   }
 
-  const origin = process.env.NEXT_PUBLIC_SITE_ORIGIN ?? new URL(request.url).origin;
+  const origin = publicOrigin(request.headers, request.url);
+  const wire = toWireContext(context);
   const page = renderProfileDocument({
     resolution,
     origin,
     beaconUrl: process.env.NEXT_PUBLIC_BEACON_URL ?? "/v1/events",
-    variant: variantFingerprint(resolution.varyOn, context),
+    variant: variantFingerprint(resolution.varyOn, wire),
   });
+
+  /**
+   * The edge keyed this request under a mask published for an older version of
+   * the profile, so it may not cover a dimension the rules have since started
+   * reading. `api/src/routes/public.ts` refuses to let a stale key store an
+   * answer on both of its routes; this is the same refusal for this one.
+   */
+  const stale = edge !== null && edge.version > 0 && edge.version < resolution.version;
 
   const headers = new Headers({
     "content-type": "text/html; charset=utf-8",
-    "cache-control": cacheControlFor(resolution.sMaxAge),
+    "cache-control": stale ? "no-store" : cacheControlFor(resolution.sMaxAge),
     "x-content-type-options": "nosniff",
     "referrer-policy": "strict-origin-when-cross-origin",
     // The inline style and script blocks are ours, not creator input, and they
@@ -107,7 +139,7 @@ function sha256(source: string): string {
  * echo it back, which is what makes "this variant converts better" answerable
  * without storing the visitor's actual country or device against the click.
  */
-function variantFingerprint(varyOn: string[], context: VisitorContext): string {
+function variantFingerprint(varyOn: string[], context: WireVisitorContext): string {
   const values = context as unknown as Record<string, unknown>;
   if (varyOn.length === 0) return "base";
   const parts = varyOn

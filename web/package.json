@@ -5,6 +5,7 @@
   "scripts": {
     "dev": "next dev",
     "build": "next build",
+    "build:lambda": "node scripts/package-lambda.mjs",
     "start": "next start",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",

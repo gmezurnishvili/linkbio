@@ -4,7 +4,7 @@ import { logger } from 'hono/logger';
 import { secureHeaders } from 'hono/secure-headers';
 import { requestId } from 'hono/request-id';
 import { bodyLimit } from 'hono/body-limit';
-import { notFound, onError, tooLarge } from './errors.ts';
+import { forbidden, notFound, onError, tooLarge } from './errors.ts';
 import { env } from './env.ts';
 import { auth } from './routes/auth.ts';
 import { me } from './routes/me.ts';
@@ -57,6 +57,26 @@ export function createApp(repo: Repo) {
     exposeHeaders: ['etag', 'x-request-id'],
     maxAge: 86400,
   }));
+
+  /**
+   * The function URL is `authType: NONE`, because Origin Access Control cannot
+   * front a URL that browsers POST to — a signed request to a function URL must
+   * carry its own body hash in `x-amz-content-sha256`, computed by the viewer,
+   * and Lambda refuses `UNSIGNED-PAYLOAD`. So the URL is reachable by anyone
+   * who learns it, and this is what makes finding it useless: CloudFront adds
+   * the secret as a custom origin header, which overwrites anything a viewer
+   * sent under that name, and a request arriving without it did not come
+   * through CloudFront — and so did not pass the WAF's rate limit.
+   *
+   * Unset outside deployment, where there is no CloudFront and no WAF to go
+   * around, so every local run and every test skips this.
+   */
+  if (env.originSecret) {
+    app.use('*', async (c, next) => {
+      if (c.req.header('x-origin-secret') !== env.originSecret) throw forbidden('not reachable directly');
+      await next();
+    });
+  }
 
   app.use('*', async (c, next) => { c.set('repo', repo); await next(); });
 

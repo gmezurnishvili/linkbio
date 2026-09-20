@@ -1,4 +1,5 @@
 import { cookies, headers } from "next/headers";
+import { originFetch } from "@/lib/api/origin-fetch";
 
 /**
  * Tokens live in httpOnly cookies and are attached to API calls by the proxy
@@ -145,7 +146,7 @@ export async function exchange(
   const origin = process.env.API_ORIGIN;
   if (!origin) throw new Error("API_ORIGIN is not set");
 
-  const res = await fetch(`${origin}${path}`, {
+  const res = await originFetch(`${origin}${path}`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify(body),

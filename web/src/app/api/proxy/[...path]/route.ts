@@ -1,6 +1,7 @@
 import { currentAccessToken, clearTokens } from "@/lib/auth/session";
 import { isAllowedProxyPath } from "@/lib/proxy/allowlist";
 import { isSameOrigin } from "@/lib/auth/same-origin";
+import { originFetch } from "@/lib/api/origin-fetch";
 
 /**
  * /api/proxy/* → the backend, with the access token attached server-side.
@@ -75,7 +76,7 @@ async function handler(request: Request, ctx: { params: Promise<{ path: string[]
 
   let upstream: Response;
   try {
-    upstream = await fetch(target, { method: request.method, headers, body, cache: "no-store" });
+    upstream = await originFetch(target, { method: request.method, headers, body, cache: "no-store" });
   } catch {
     return Response.json({ message: "Couldn't reach the API. Retry." }, { status: 502 });
   }

@@ -1,0 +1,104 @@
+name: CI
+
+# Every gate this repo has, on every push and pull request. Three of them —
+# `next build`, the web unit tests and `cdk synth` — could not be run from the
+# development environment this project was built in, so until now nothing had
+# ever checked them on a clean machine.
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  api:
+    name: api — typecheck, tests, bundle
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: api
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          # Must match the Lambda runtime: the source uses type stripping, which
+          # is what `--experimental-strip-types` runs, and esbuild targets node22.
+          node-version: 22
+          cache: npm
+          cache-dependency-path: api/package-lock.json
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+      # Proves the Lambda bundles before anything tries to deploy it, and
+      # produces the `dist/` that `cdk synth` uploads as the API's code asset.
+      - run: npm run build
+
+  web:
+    name: web — typecheck, tests, build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+      # `build:lambda` rather than `build`: it is the command that produces the
+      # deployable artifact, and it pins the NEXT_PUBLIC_* values rather than
+      # inheriting whatever .env file happens to be present.
+      - run: npm run build:lambda
+      # The one part of the deployment with no equivalent in development —
+      # the Function URL event translation — exercised against the real bundle.
+      - run: node --test test/lambda-handler.test.mjs
+      - uses: actions/upload-artifact@v4
+        with:
+          name: web-dist
+          path: web/dist
+          retention-days: 5
+
+  synth:
+    name: infra — cdk synth
+    runs-on: ubuntu-latest
+    # Both code assets have to exist on disk before the stack can be
+    # synthesized: `lambda.Code.fromAsset` resolves them at synth time, not at
+    # deploy time.
+    needs: [api, web]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: api/package-lock.json
+      - run: npm ci
+        working-directory: api
+      - run: npm run build
+        working-directory: api
+      - uses: actions/download-artifact@v4
+        with:
+          name: web-dist
+          path: web/dist
+      - run: npx cdk synth
+        working-directory: api
+        env:
+          # No credentials in CI, so the stack is synthesized environment-
+          # agnostically. A real deploy supplies both from the deploying role.
+          CDK_DEFAULT_REGION: us-east-1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cdk-template
+          path: api/cdk.out/Linkbio.template.json
+          retention-days: 5

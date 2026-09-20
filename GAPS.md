@@ -5,16 +5,17 @@ and most of Tranche 1. Analytics is out of scope by request: the beacon,
 `recordEvents`, the daily rollups and `GET /v1/profiles/:id/analytics` all exist
 and nothing reads them. That is a known and accepted hole.
 
-Gates: api `npm test` **413 passing** (was 397; 16 new cover the routes added
-below), `tsc --noEmit` clean. web `tsc --noEmit` clean. web `vitest` cannot
-start from a Linux shell because `node_modules` is a Windows install — rollup's
-native binding — so it has to run on your machine; it is not a code defect.
-`next build` is still unverified for the same reason.
+Gates: api `npm test` **418 passing**, `tsc --noEmit` clean. web `tsc --noEmit`
+clean, `vitest` **131 passing**, `next build` clean, `cdk synth` clean. All five
+now run on a clean Linux checkout with fresh installs, and on CI — the earlier
+note that `vitest` and `next build` could not be run from this side was an
+artefact of sharing a Windows `node_modules`, not a code defect, and is gone.
 
-The short version has changed. The happy path is now real: a stranger can sign
-up, build a page, publish it, and every link on it resolves. What is left is one
-architectural decision about the production topology, the account subsystem,
-and deployment.
+The short version has changed twice. The happy path became real last round: a
+stranger can sign up, build a page, publish it, and every link on it resolves.
+This round the production topology was decided and built (3.1), so the repo is
+deployable — see `DEPLOYING.md`. What is left is the account subsystem, a
+domain, and actually running `cdk deploy`.
 
 ---
 
@@ -95,21 +96,48 @@ until there is traffic.
 
 ## Part 3 — Still missing
 
-### 3.1 The production topology decision (the one architectural item)
+### 3.1 The production topology — decided and built
 
-`infra/stack.ts` builds one distribution whose default behavior is the API
-origin, with `/r/*` and `/p/*` as extra behaviors on the same origin. **The Next
-app is not an origin in that stack at all.** The `/r/*` route handler added
-above makes clicks work in development and in any single-origin deployment of
-the web app, but it puts the Next Lambda in the click path, which is exactly
-what the edge hot-link short-circuit exists to avoid.
+**Closed.** The web app is now the distribution's default origin, with `/r/*`,
+`/p/*`, `/v1/*` and `/health` as behaviours on the API. A click no longer
+touches the Next Lambda, so `HOT_LINKS` and the edge function's `/r/` branch are
+reachable for the first time. `DEPLOYING.md` has the behaviour table and the
+reasoning; the pieces that did not exist before are:
 
-The production shape the design assumes is: web app as the default origin;
-`/r/*`, `/p/*`, `/v1/*` and `/health` as behaviors on the API. Until the
-distribution has both origins, `HOT_LINKS` and the edge function's `/r/` branch
-are unreachable and `dev/probe.sh` does not describe what you would ship.
+- `web/lambda/handler.mjs` — Function URL events to the Next standalone server,
+  in place of the AWS Lambda Web Adapter layer. Sixty lines, no region-pinned
+  layer ARN, no `run.sh` needing an exec bit that a Windows checkout would drop,
+  and exercised against the real bundle in `web/test/lambda-handler.test.mjs`.
+- `web/scripts/package-lambda.mjs` — builds with the `NEXT_PUBLIC_*` values
+  pinned, so an artifact does not inherit whoever's `.env.local` built it, and
+  assembles `web/dist`. `next.config.ts` also pins `outputFileTracingRoot`:
+  without it Next walks up past the repo looking for lockfiles — a stray
+  `package.json` in a home directory is enough — and writes `server.js` to
+  `.next/standalone/<path-from-root>/`, where nothing that consumes it looks.
+- `api/edge/page.js` — the root-path twin of `normalize.js`. `/<handle>` is one
+  path segment, which `normalize.js` returns early on, so the public page would
+  otherwise have been cached on path alone while the origin varied by viewer.
+  It also copies the viewer's Host into `x-forwarded-host`, because a function
+  URL origin never sees it.
+- `web/src/lib/context/edge-ctx.ts` — the page resolves against `x-ctx` rather
+  than re-deriving context from raw headers, and refuses to be cached under a
+  key built from a mask older than the profile. Both are what
+  `api/src/routes/public.ts` already did for its two routes.
+- `web/src/lib/site/public-origin.ts` — behind a function URL `request.url` is
+  a hostname no visitor typed, so the canonical URL named the wrong host and,
+  worse, the same-origin check on every write compared against it and would have
+  refused every save in the dashboard. One helper resolves the real origin from
+  the forwarded viewer host; both callers use it.
+- **Origin access is a shared secret, not OAC.** Origin Access Control cannot
+  front a function URL that browsers post to: a signed request must carry its
+  own body hash in `x-amz-content-sha256`, computed by the viewer, and Lambda
+  refuses `UNSIGNED-PAYLOAD`, so every form post and every beacon is a 403 while
+  GETs look fine. The first deploy found this. Both function URLs are now
+  `authType: NONE` with a CloudFront custom origin header both Lambdas require
+  (`-c originSecret=…`); a SigV4 signer written for the IAM path was deleted
+  with it.
 
-Also still dead: `linkBlock`'s fallback `href` of `/<handle>/l/<slug>`. No
+Still dead: `linkBlock`'s fallback `href` of `/<handle>/l/<slug>`. No
 route, nothing sets `slug`, and it only fires when `href` is absent — which it
 never is.
 
@@ -147,17 +175,25 @@ an external issuer, and taking it deletes most of this section.
 
 ### 3.5 Delivery and operations
 
-- **The web app has no deployment.** CDK covers the table, GSIs, the API Lambda,
-  the function URL with OAC, the KeyValueStore, both CloudFront Functions, the
-  WAF, the refresher schedule, log retention, a DLQ and three alarms. There is
-  nothing for Next.js — no Lambda, no adapter, no S3, no Amplify, no ECS.
+- ~~**The web app has no deployment.**~~ **Closed** — see 3.1. CDK now covers
+  the web Lambda, its function URL with OAC, a third CloudFront Function, three
+  more origin request policies, the behaviour split and two more alarms.
 - **No domain.** No ACM certificate, no Route 53, no alternate domain name. The
   `__Host-` cookie strategy and the "same apex serves creator content" threat
   model in `session.ts` are both untested against a real hostname.
-- **No CI.** No `.github/workflows`. 413 API tests, the web suite, two
-  typechecks and a `cdk synth` all pass and nothing runs them on a push.
-- **`next build` unverified.** It cannot be run from this side; run it before
-  anything else here.
+- ~~**No CI.**~~ **Closed.** `.github/workflows/ci.yml` runs both typechecks,
+  both suites, both bundles, the Lambda handler tests against the real build,
+  and `cdk synth`, on every push and pull request.
+- ~~**`next build` unverified.**~~ **Closed** — it passes, and CI runs it.
+- **Static assets are served by the web Lambda**, cached at the edge behind
+  `/_next/static/*` with the managed optimized policy. Correct and simple, but
+  an S3 origin for that behaviour is the obvious next optimisation and was left
+  out deliberately: an empty bucket fails as a silently broken dashboard, and
+  nothing here can be deploy-tested yet.
+- **The account's Lambda concurrency limit.** A new AWS account allows 10
+  concurrent executions in total, shared by the web Lambda, the API and the
+  refresher. Enough to deploy and try; not enough to serve traffic, and it is
+  why nothing in the stack reserves concurrency by default.
 - **No hermetic local environment.** No Dockerfile, no compose file, no DynamoDB
   Local, so the `dynamo` driver cannot be exercised without an AWS account and
   `memory` loses every account on restart.
@@ -173,15 +209,18 @@ an external issuer, and taking it deletes most of this section.
 
 ## Part 4 — Suggested order from here
 
-**Next.** Verify `next build`, then run the whole thing once: `npm run seed`,
-sign in, switch pages, schedule a block, fetch a feed, unpublish, sign out.
+**Next.** `cdk bootstrap`, then `cdk deploy`, then work down the verification
+list in `DEPLOYING.md`. That is the step that turns unit-tested edge code into
+working edge code, and it is the only way to learn whether OAC, the SigV4 call
+and the KeyValueStore ETag handling behave — none of which can be checked from
+here.
 
 **Then, pick one:**
 
-1. **Ship it.** Web deployment, one distribution with both origins (3.1), a
-   domain and a certificate, CI running the suites that already pass. Then
-   `cdk deploy` and find out what the edge actually does. This is the tranche
-   that turns unit-tested edge code into working edge code.
+1. **A domain and a certificate.** The `__Host-` cookie strategy and the "same
+   apex serves creator content" threat model in `session.ts` are both untested
+   against a real hostname, and canonical URLs are the `*.cloudfront.net` name
+   until this exists.
 2. **The account subsystem.** Decide own-identity versus Cognito first; the
    answer changes the size of this from "a week" to "an afternoon".
 

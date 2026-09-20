@@ -1,4 +1,4 @@
-import { Stack, RemovalPolicy, Duration, CfnOutput, type StackProps } from 'aws-cdk-lib';
+import { Stack, RemovalPolicy, Duration, CfnOutput, Fn, type StackProps } from 'aws-cdk-lib';
 import * as dynamodb from 'aws-cdk-lib/aws-dynamodb';
 import * as lambda from 'aws-cdk-lib/aws-lambda';
 import * as cloudfront from 'aws-cdk-lib/aws-cloudfront';
@@ -31,6 +31,56 @@ export type LinkbioStackProps = StackProps & {
   githubTokenSecretArn?: string;
   /** How often the feed refresher runs. Defaults to every five minutes. */
   refreshRate?: Duration;
+  /**
+   * The built Next app: the directory `web/scripts/package-lambda.mjs` writes.
+   * Relative to `api/`, because that is where `cdk.json` runs.
+   */
+  webAssetPath?: string;
+  /** Memory for the web Lambda. 1769 MB is one full vCPU, which is what SSR cold starts respond to. */
+  webMemorySize?: number;
+  /**
+   * A shared secret CloudFront sends to both origins as `x-origin-secret`, and
+   * both origins require.
+   *
+   * The function URLs are `authType: NONE`, which is not a preference: Origin
+   * Access Control signs origin requests, and a signed request to a Lambda
+   * function URL must carry the SHA-256 of its own body in
+   * `x-amz-content-sha256` — computed by the *viewer*, because CloudFront does
+   * not hash the body for you, and Lambda rejects `UNSIGNED-PAYLOAD`. A browser
+   * cannot do that, so under OAC every form post, every Server Action and every
+   * click beacon is a 403. AWS documents this; it is why nothing serving a
+   * browser puts OAC in front of a function URL.
+   *
+   * What is left to keep the function URLs from being an open back door past
+   * the WAF is a secret CloudFront adds and viewers cannot: a custom origin
+   * header overwrites any header of the same name from the viewer.
+   *
+   * Omitting it deploys a stack whose function URLs answer anyone who finds
+   * them. The app's own auth still applies; the WAF's rate limit and managed
+   * rules do not. Generate one with `openssl rand -hex 32` and pass it as
+   * `-c originSecret=…`.
+   */
+  originSecret?: string;
+  /**
+   * Concurrent executions to reserve for the feed refresher. **Off by default.**
+   *
+   * Reserving one would stop two runs overlapping and doubling the rate-limit
+   * pressure on YouTube and GitHub. That is worth having, and it is not worth
+   * an undeployable stack: a reservation must leave at least 10 unreserved
+   * concurrent executions in the account, and a new AWS account's *entire*
+   * limit is 10 — so reserving even one is rejected outright. That is the
+   * account's limit talking, not this function's, and the error
+   * ("decreases account's UnreservedConcurrentExecution below its minimum
+   * value") does not say so.
+   *
+   * Nothing depends on the reservation for correctness. The refresher is
+   * idempotent by construction — the work list is a due-time index and the
+   * first thing each refresh does is push that time forward — so two runs
+   * duplicate a fetch and corrupt nothing.
+   *
+   * Set it to 1 once the account's concurrency limit has been raised.
+   */
+  refresherReservedConcurrency?: number;
 };
 
 export class LinkbioStack extends Stack {
@@ -118,6 +168,7 @@ export class LinkbioStack extends Stack {
           ? { JWKS_URL: props.jwksUrl, JWT_ISSUER: props.jwtIssuer ?? '', JWT_AUDIENCE: props.jwtAudience ?? '' }
           : {}),
         CORS_ORIGINS: (props?.corsOrigins ?? []).join(','),
+        ...(props?.originSecret ? { ORIGIN_SECRET: props.originSecret } : {}),
       },
       // Deliberately not in a VPC. DynamoDB and CloudFront are reached over the
       // public AWS endpoints, so attaching one would only add a NAT gateway at
@@ -134,7 +185,9 @@ export class LinkbioStack extends Stack {
       resources: [kvs.keyValueStoreArn],
     }));
 
-    const fnUrl = api.addFunctionUrl({ authType: lambda.FunctionUrlAuthType.AWS_IAM });
+    // AWS_IAM plus OAC is the tempting shape and it does not work for anything
+    // a browser posts to — see `originSecret` above.
+    const fnUrl = api.addFunctionUrl({ authType: lambda.FunctionUrlAuthType.NONE });
 
     // ---------- feed refresher ----------
     //
@@ -167,10 +220,11 @@ export class LinkbioStack extends Stack {
         retention: logs.RetentionDays.ONE_MONTH,
         removalPolicy: RemovalPolicy.DESTROY,
       }),
-      // One run at a time. Two overlapping runs would each fetch the same due
-      // blocks — harmless, but it doubles the rate-limit pressure on YouTube
-      // and GitHub for no gain.
-      reservedConcurrentExecutions: 1,
+      // Unreserved unless asked for — see the prop. Overlapping runs are
+      // wasteful rather than wrong.
+      ...(props?.refresherReservedConcurrency
+        ? { reservedConcurrentExecutions: props.refresherReservedConcurrency }
+        : {}),
       deadLetterQueueEnabled: true,
       environment: {
         TABLE_NAME: table.tableName,
@@ -204,6 +258,54 @@ export class LinkbioStack extends Stack {
       schedule: events.Schedule.rate(props?.refreshRate ?? Duration.minutes(5)),
       targets: [new targets.LambdaFunction(refresher, { retryAttempts: 0 })],
     });
+
+    // ---------- web ----------
+    //
+    // The Next app, as the distribution's default origin.
+    //
+    // It was not an origin in this stack at all before: the default behaviour
+    // pointed at the API, so the dashboard had nowhere to be served from and
+    // `/r/*` was answered by a route handler inside Next — which put the Next
+    // Lambda in the click path, the one thing the edge hot-link short-circuit
+    // exists to avoid. With the web app as the default and `/r/*`, `/p/*`,
+    // `/v1/*` and `/health` as behaviours on the API, a click never reaches it
+    // and `HOT_LINKS` becomes reachable for the first time.
+
+    const webFn = new lambda.Function(this, 'Web', {
+      runtime: lambda.Runtime.NODEJS_22_X,
+      architecture: lambda.Architecture.ARM_64,
+      // `lambda/handler.mjs`, copied to the root of the bundle beside Next's
+      // standalone `server.js`.
+      handler: 'handler.handler',
+      code: lambda.Code.fromAsset(props?.webAssetPath ?? '../web/dist'),
+      // Server rendering is CPU-bound and Lambda scales CPU with memory: 1769 MB
+      // is one full vCPU, and it is cold starts rather than steady-state cost
+      // that this buys down. Below ~1 GB the first render of the dashboard is
+      // measured in seconds.
+      memorySize: props?.webMemorySize ?? 1769,
+      // Longer than the API's 10s so a slow upstream surfaces as the API's
+      // timeout, with a 503 the page can render, rather than as this one's.
+      timeout: Duration.seconds(15),
+      logGroup: new logs.LogGroup(this, 'WebLogs', {
+        retention: logs.RetentionDays.ONE_MONTH,
+        removalPolicy: RemovalPolicy.DESTROY,
+      }),
+      environment: {
+        NODE_ENV: 'production',
+        NODE_OPTIONS: '--enable-source-maps',
+        // Host only: `FunctionUrl.url` ends in a slash and every path this app
+        // builds starts with one, which would make every request `//v1/...`.
+        API_ORIGIN: Fn.join('', ['https://', Fn.select(2, Fn.split('/', fnUrl.url))]),
+        // Presented on every server-side call to the API, which goes direct
+        // rather than back through the CDN. See web/src/lib/api/origin-fetch.ts.
+        ...(props?.originSecret ? { ORIGIN_SECRET: props.originSecret } : {}),
+        // Read at request time (it is not a NEXT_PUBLIC_ value, so it is not
+        // baked into the build). Must not exceed the cache policy's maxTtl.
+        MAX_S_MAXAGE: '3600',
+      },
+    });
+
+    const webFnUrl = webFn.addFunctionUrl({ authType: lambda.FunctionUrlAuthType.NONE });
 
     // ---------- distribution ----------
 
@@ -250,6 +352,48 @@ export class LinkbioStack extends Stack {
       code: cloudfront.FunctionCode.fromFile({ filePath: 'edge/auth-header.js' }),
     });
 
+    /**
+     * The public page on the web origin. Same shape as `originRequest` — the
+     * origin needs the raw viewer signals even though only `x-ctx` is in the
+     * key — plus the viewer's host, which a Lambda function URL origin never
+     * sees for itself because OAC signs against the origin's own hostname.
+     */
+    const pageRequest = new cloudfront.OriginRequestPolicy(this, 'PageRequest', {
+      headerBehavior: cloudfront.OriginRequestHeaderBehavior.allowList(
+        'x-ctx', 'x-forwarded-host', 'cloudfront-viewer-country',
+        'cloudfront-is-mobile-viewer', 'cloudfront-is-tablet-viewer',
+        'user-agent', 'referer', 'accept-language',
+      ),
+      queryStringBehavior: cloudfront.OriginRequestQueryStringBehavior.all(),
+      // The public page is cached and must never vary on a cookie.
+      cookieBehavior: cloudfront.OriginRequestCookieBehavior.none(),
+    });
+
+    /**
+     * The dashboard, sign-in and the proxy.
+     *
+     * The managed all-viewer policy rather than an allowlist, for two reasons.
+     *
+     * An allowlist is capped at ten headers and this surface needs more than
+     * ten: cookies carry the session, `origin` is the CSRF check, `if-match` is
+     * the version conflict, `content-type` is every form post, and the App
+     * Router needs `rsc`, `next-action`, `next-router-state-tree`,
+     * `next-router-prefetch` and `next-url` or client navigation and Server
+     * Actions quietly stop working. The first deploy failed on exactly that
+     * quota.
+     *
+     * And the reason an allowlist was reached for in the first place no longer
+     * applies: it was to keep `Authorization` away from Origin Access Control's
+     * own signature, and there is no OAC here any more.
+     */
+    const appRequest = cloudfront.OriginRequestPolicy.ALL_VIEWER_EXCEPT_HOST_HEADER;
+
+    const pageNormalizer = new cloudfront.Function(this, 'PageNormalizer', {
+      runtime: cloudfront.FunctionRuntime.JS_2_0, // required for KeyValueStore access
+      keyValueStore: kvs,
+      code: cloudfront.FunctionCode.fromFile({ filePath: 'edge/page.js' }),
+    });
+
     // Rate limiting has to live somewhere the whole fleet can see. The
     // in-process counters on the beacon and the credential endpoints bound what
     // one warm container will do, which is not the same thing.
@@ -290,7 +434,13 @@ export class LinkbioStack extends Stack {
       ],
     });
 
-    const origin = origins.FunctionUrlOrigin.withOriginAccessControl(fnUrl, {
+    // Sent by CloudFront, never by a viewer: a custom origin header overwrites
+    // a viewer header of the same name. Both Lambdas refuse a request without
+    // it when ORIGIN_SECRET is set.
+    const customHeaders = props?.originSecret ? { 'x-origin-secret': props.originSecret } : undefined;
+
+    const apiOrigin = new origins.FunctionUrlOrigin(fnUrl, {
+      customHeaders,
       readTimeout: Duration.seconds(10),
       // The architecture deliberately aligns every edge location's TTL to the
       // same rule boundary, so they all expire in the same instant and all miss
@@ -300,8 +450,16 @@ export class LinkbioStack extends Stack {
       originShieldRegion: this.region,
     });
 
-    const behavior = {
-      origin,
+    const webOrigin = new origins.FunctionUrlOrigin(webFnUrl, {
+      customHeaders,
+      readTimeout: Duration.seconds(15),
+      originShieldEnabled: true,
+      originShieldRegion: this.region,
+    });
+
+    /** `/r/*` and `/p/*`: the API's cached public surface. */
+    const redirectBehavior = {
+      origin: apiOrigin,
       cachePolicy: redirectCache,
       originRequestPolicy: originRequest,
       functionAssociations: [{
@@ -311,20 +469,88 @@ export class LinkbioStack extends Stack {
       viewerProtocolPolicy: cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
     };
 
+    /**
+     * The default: the Next app, serving `/<handle>` at the root.
+     *
+     * Cached on `x-ctx` exactly as the API's public routes are, and for the same
+     * reason — the page's content depends on the viewer, so the key must too.
+     * `edge/page.js` writes that header; `web/src/app/[handle]/route.ts` decodes
+     * it and answers as a function of it and nothing else.
+     */
+    const pageBehavior = {
+      origin: webOrigin,
+      cachePolicy: redirectCache,
+      originRequestPolicy: pageRequest,
+      functionAssociations: [{
+        function: pageNormalizer,
+        eventType: cloudfront.FunctionEventType.VIEWER_REQUEST,
+      }],
+      viewerProtocolPolicy: cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
+    };
+
+    /**
+     * The dashboard, sign-in and the token proxy: per-user, cookie-bearing, and
+     * never cached anywhere.
+     *
+     * `HTTPS_ONLY` rather than `REDIRECT_TO_HTTPS`: a redirect turns a POST into
+     * a GET and loses its body, and every write in this app is a POST.
+     */
+    const appBehavior = {
+      origin: webOrigin,
+      cachePolicy: cloudfront.CachePolicy.CACHING_DISABLED,
+      originRequestPolicy: appRequest,
+      allowedMethods: cloudfront.AllowedMethods.ALLOW_ALL,
+      viewerProtocolPolicy: cloudfront.ViewerProtocolPolicy.HTTPS_ONLY,
+      functionAssociations: [{
+        function: pageNormalizer,
+        eventType: cloudfront.FunctionEventType.VIEWER_REQUEST,
+      }],
+    };
+
     const dist = new cloudfront.Distribution(this, 'Cdn', {
-      defaultBehavior: behavior,
+      defaultBehavior: pageBehavior,
+      // Order matters: CloudFront takes the first pattern that matches, not the
+      // most specific one. `/_next/static/*` has to precede `/_next/*`, and the
+      // dashboard paths have to precede the default, which would otherwise
+      // treat `/login` as a creator's handle.
       additionalBehaviors: {
-        '/r/*': behavior,
-        '/p/*': behavior,
+        /**
+         * Content-hashed filenames, so they are immutable and the managed
+         * optimized policy's long TTL is safe. This is the one web behaviour
+         * that should essentially never reach the origin twice.
+         */
+        '/_next/static/*': {
+          origin: webOrigin,
+          cachePolicy: cloudfront.CachePolicy.CACHING_OPTIMIZED,
+          // No origin request policy: a content-hashed asset depends on nothing
+          // about the viewer, and forwarding anything would only add cache keys.
+          viewerProtocolPolicy: cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
+        },
+        // The image optimizer and RSC payloads. Uncached rather than wrong.
+        '/_next/*': appBehavior,
+        // `/app` exactly, and then everything under it. Not `/app*`, which also
+        // matches `/apple` — a handle nobody has reserved.
+        '/app': appBehavior,
+        '/app/*': appBehavior,
+        '/login': appBehavior,
+        '/signup': appBehavior,
+        '/logout': appBehavior,
+        '/api/proxy/*': appBehavior,
+        // The click redirector and the JSON resolution, both on the API. This
+        // is the routing that makes the edge hot-link short-circuit reachable:
+        // a click never wakes the Next Lambda.
+        '/r/*': redirectBehavior,
+        '/p/*': redirectBehavior,
         // The control plane is per-user and must never be cached.
         //
-        // ALL_VIEWER_EXCEPT_HOST_HEADER forwards the viewer's Authorization
-        // header, and OAC signs the origin request with SigV4 using that same
-        // header — the two collide, and the Lambda sees CloudFront's signature
-        // instead of the caller's bearer token. Forwarding an explicit list and
-        // carrying the bearer in its own header avoids the conflict.
+        // Still an explicit allowlist, and still carrying the bearer in
+        // `x-authorization`: CloudFront refuses `Authorization` in an origin
+        // request policy allowlist at all, and `edge/auth-header.js` copies it
+        // to a name it does not claim. `api/src/auth.ts` reads that first and
+        // falls back to `authorization`, so calling the origin directly in
+        // development still works.
         '/v1/*': {
-          origin,
+          origin: apiOrigin,
           cachePolicy: cloudfront.CachePolicy.CACHING_DISABLED,
           originRequestPolicy: controlPlaneRequest,
           allowedMethods: cloudfront.AllowedMethods.ALLOW_ALL,
@@ -333,6 +559,11 @@ export class LinkbioStack extends Stack {
             function: authHeader,
             eventType: cloudfront.FunctionEventType.VIEWER_REQUEST,
           }],
+        },
+        '/health': {
+          origin: apiOrigin,
+          cachePolicy: cloudfront.CachePolicy.CACHING_DISABLED,
+          viewerProtocolPolicy: cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
         },
       },
       httpVersion: cloudfront.HttpVersion.HTTP2_AND_3,
@@ -361,6 +592,10 @@ export class LinkbioStack extends Stack {
       'Concurrency limit reached — requests are being rejected before they run.');
     alarm('Api5xx', dist.metric5xxErrorRate({ period: Duration.minutes(5) }), 1,
       'CloudFront is serving 5xx for more than 1% of requests.');
+    alarm('WebErrors', webFn.metricErrors({ period: Duration.minutes(5) }), 5,
+      'The web app is throwing. A 500 here is a creator page or a dashboard route, not a click.');
+    alarm('WebThrottles', webFn.metricThrottles({ period: Duration.minutes(5) }), 0,
+      'The web app hit its concurrency limit — requests are rejected before they run.');
     alarm('FeedRefresherErrors', refresher.metricErrors({ period: Duration.minutes(15) }), 2,
       'The feed refresher is throwing. Individual feed failures are backed off per block and logged, '
       + 'not thrown, so this means the loop itself is broken.');
@@ -370,5 +605,7 @@ export class LinkbioStack extends Stack {
     new CfnOutput(this, 'TableName', { value: table.tableName });
     new CfnOutput(this, 'KvsArn', { value: kvs.keyValueStoreArn });
     new CfnOutput(this, 'FeedRefresherName', { value: refresher.functionName });
+    new CfnOutput(this, 'WebFunctionName', { value: webFn.functionName });
+    new CfnOutput(this, 'SiteUrl', { value: `https://${dist.distributionDomainName}` });
   }
 }

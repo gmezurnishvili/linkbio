@@ -11,7 +11,9 @@
     "build:slim": "esbuild src/lambda.ts --bundle --platform=node --target=node22 --format=esm --outfile=dist/index.mjs --sourcemap --banner:js=\"import{createRequire}from'module';const require=createRequire(import.meta.url);\" --external:@aws-sdk/client-dynamodb --external:@aws-sdk/lib-dynamodb",
     "build:refresher": "esbuild src/refresher.ts --bundle --platform=node --target=node22 --format=esm --outfile=dist-refresher/index.mjs --sourcemap --banner:js=\"import{createRequire}from'module';const require=createRequire(import.meta.url);\"",
     "refresh:once": "node --env-file-if-exists=.env --experimental-strip-types scripts/refresh-once.ts",
-    "seed": "node --env-file-if-exists=.env --experimental-strip-types scripts/seed.ts"
+    "seed": "node --env-file-if-exists=.env --experimental-strip-types scripts/seed.ts",
+    "build:all": "node ../web/scripts/package-lambda.mjs && npm run build",
+    "deploy": "npm run build:all && cdk deploy"
   },
   "dependencies": {
     "@aws-sdk/client-cloudfront-keyvaluestore": "^3.700.0",

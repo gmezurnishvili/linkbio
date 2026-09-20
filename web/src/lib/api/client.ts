@@ -24,6 +24,7 @@ import {
 } from "./types";
 import type { FeedOutcome } from "./types";
 import type { BlockRule } from "@/lib/rules/schema";
+import { originFetch } from "./origin-fetch";
 
 /**
  * In the browser, every call goes to /api/proxy on our own origin. The access
@@ -77,7 +78,9 @@ async function request(
   if (opts.token) headers.authorization = `Bearer ${opts.token}`;
   if (opts.version !== undefined) headers["if-match"] = String(opts.version);
 
-  const res = await fetch(`${base()}${path}`, {
+  // In the browser this is a plain fetch to /api/proxy on our own origin. On
+  // the server it may have to sign for the API's IAM-protected function URL.
+  const res = await originFetch(`${base()}${path}`, {
     method,
     headers,
     body: body === undefined ? undefined : JSON.stringify(body),

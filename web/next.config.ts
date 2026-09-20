@@ -32,6 +32,46 @@ const DASHBOARD_CSP = [
 
 const config: NextConfig = {
   reactStrictMode: true,
+  /**
+   * The deployable artifact is a Lambda, not a `next start` on a box, so the
+   * build has to trace its own dependencies: `standalone` emits
+   * `.next/standalone/server.js` plus only the files that are actually reached.
+   * `scripts/package-lambda.mjs` assembles that into `dist/`, which is the
+   * directory `api/infra/stack.ts` uploads.
+   */
+  output: "standalone",
+  /**
+   * Nothing in this app uses `next/image` — the public page is hand-rendered
+   * HTML and an avatar is a plain `<img>` to an arbitrary https URL. Leaving
+   * the optimizer on made the build trace `sharp` into the bundle: 37 MB of
+   * native binaries, for a platform chosen by whichever machine ran the build.
+   * The Lambda is arm64, so a build on an x64 laptop or a Windows desktop
+   * traced binaries that could never load there — a latent runtime failure on a
+   * route nothing calls.
+   */
+  images: { unoptimized: true },
+  /**
+   * Where dependency tracing considers the project to start.
+   *
+   * Next infers this by walking up looking for lockfiles and package.json
+   * files, and it walks past the repo: a stray `package.json` in the user's
+   * home directory is enough to make the home directory the root. The
+   * standalone output is then written to `.next/standalone/<path-from-root>/`,
+   * so `server.js` lands somewhere like
+   * `.next/standalone/OneDrive/Desktop/linkbio/web/server.js` instead of
+   * `.next/standalone/server.js` — and the packaging script, the Lambda handler
+   * and `lambda.Code.fromAsset` all expect the latter.
+   *
+   * This was not hypothetical: the first build on the development machine put
+   * it exactly there. Pinning the root makes the layout identical on every
+   * machine, which is the whole point of building a deployable artifact.
+   *
+   * `process.cwd()` rather than `__dirname`/`import.meta.url` because a
+   * TypeScript config is loaded in a way that makes only one of those two
+   * available and which one depends on the Next version. Every path that builds
+   * this app runs from `web/`.
+   */
+  outputFileTracingRoot: process.cwd(),
   poweredByHeader: false,
   experimental: { optimizePackageImports: ["@dnd-kit/sortable"] },
   async headers() {

@@ -1,4 +1,5 @@
 import { isReserved, isValidHandle } from "@/lib/handles";
+import { originFetch } from "@/lib/api/origin-fetch";
 
 /**
  * GET /r/:handle/:blockId — the click redirector.
@@ -58,7 +59,7 @@ export async function GET(
 
   let upstream: Response;
   try {
-    upstream = await fetch(
+    upstream = await originFetch(
       `${origin}/r/${encodeURIComponent(handle)}/${encodeURIComponent(blockId)}`,
       { headers: forwarded, redirect: "manual", cache: "no-store" },
     );
