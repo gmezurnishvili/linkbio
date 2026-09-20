@@ -10,13 +10,21 @@ export default async function NewProfilePage() {
   const token = await currentAccessToken();
   if (!token) redirect("/login");
 
-  // Someone who already has a page and lands here by back button or bookmark
-  // should go to their page, not be asked to make a second one.
+  // This used to redirect away the moment a profile existed, which made a
+  // second page unreachable — the backend has modelled many profiles per user
+  // since it was written, `/v1/me` returns the array, and the only thing
+  // stopping anyone from having two was this redirect.
   try {
     const session = await api.session({ token });
-    const first = session.profiles[0];
-    if (first) redirect(`/app/${first.id}`);
-    return <Onboarding suggestion={suggest(session.email)} />;
+    return (
+      <Onboarding
+        suggestion={session.profiles.length === 0 ? suggest(session.email) : ""}
+        // Somewhere to go if they opened this by mistake, which is the real
+        // thing the old redirect was protecting against.
+        backTo={session.profiles[0] ? `/app/${session.profiles[0].id}` : null}
+        nth={session.profiles.length + 1}
+      />
+    );
   } catch (err) {
     if (err instanceof ApiError && err.isUnauthorized) redirect("/login?error=expired");
     throw err;

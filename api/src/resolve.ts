@@ -1,7 +1,7 @@
 import { evaluate, type Ctx, type Block as RuleBlock } from './rules/rules.ts';
 import { cacheDimensionsFor } from './publish.ts';
 import { ALL_CTX_DIMS } from './auth.ts';
-import type { Block, Profile } from './domain/types.ts';
+import type { Block, PageMode, Profile } from './domain/types.ts';
 import type { TVisitorContext } from './domain/schema.ts';
 
 export type ResolvedBlock = {
@@ -31,6 +31,7 @@ export type Resolution = {
   bio?: string;
   avatarUrl?: string;
   eventAt?: number | null;
+  mode?: PageMode;
   theme?: Record<string, string>;
   version: number;
   published: boolean;
@@ -125,6 +126,7 @@ export function resolveProfile(
     title: profile.title,
     bio: profile.bio,
     avatarUrl: profile.avatarUrl,
+    mode: profile.mode,
     eventAt: profile.eventAt,
     theme: profile.theme,
     version: profile.version,

@@ -1,5 +1,6 @@
 import { currentAccessToken, clearTokens } from "@/lib/auth/session";
 import { isAllowedProxyPath } from "@/lib/proxy/allowlist";
+import { isSameOrigin } from "@/lib/auth/same-origin";
 
 /**
  * /api/proxy/* → the backend, with the access token attached server-side.
@@ -94,28 +95,6 @@ async function handler(request: Request, ctx: { params: Promise<{ path: string[]
 
 function tooLarge() {
   return Response.json({ message: "That request body is too large." }, { status: 413 });
-}
-
-/**
- * The request's Origin against ours. The deployed origin is configured, but a
- * preview deployment has no configured name, so the request's own origin
- * counts too. A write with no Origin header at all is refused: every browser
- * that can reach this route sends one on a cross-site request.
- */
-function isSameOrigin(request: Request): boolean {
-  const sent = request.headers.get("origin");
-  if (!sent) return false;
-
-  const ours = new Set([new URL(request.url).origin]);
-  const configured = process.env.NEXT_PUBLIC_SITE_ORIGIN;
-  if (configured) {
-    try {
-      ours.add(new URL(configured).origin);
-    } catch {
-      // A malformed NEXT_PUBLIC_SITE_ORIGIN should not widen anything.
-    }
-  }
-  return ours.has(sent);
 }
 
 export const GET = handler;

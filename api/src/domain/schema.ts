@@ -174,8 +174,11 @@ export const BlockCreate = z.object({
   target: SafeUrl.optional(),
   icon: z.string().max(64).optional(),
   hidden: z.boolean().default(false),
-  activeFrom: z.number().int().positive().optional(),
-  activeUntil: z.number().int().positive().optional(),
+  // Nullable for the same reason `eventAt` is: omitting a key means "leave it
+  // alone", so without an explicit null a scheduling window could be set and
+  // never cleared. Null is stored and read as "no boundary".
+  activeFrom: z.number().int().positive().nullable().optional(),
+  activeUntil: z.number().int().positive().nullable().optional(),
   rules: RuleSet.default([]),
   feed: z.object({
     source: z.enum(['youtube', 'rss', 'github', 'spotify', 'twitch']),
@@ -197,7 +200,7 @@ export const BlockCreate = z.object({
  */
 type BlockShape = {
   kind?: string; target?: string; feed?: unknown;
-  activeFrom?: number; activeUntil?: number;
+  activeFrom?: number | null; activeUntil?: number | null;
 };
 
 export function checkBlockShape(b: BlockShape, ctx: z.RefinementCtx) {
@@ -242,6 +245,14 @@ export const ProfileCreate = z.object({
   // without an explicit null there is no way to switch a page from event back
   // to standard. The settings form offers that control.
   eventAt: z.number().int().positive().nullable().optional(),
+  /**
+   * How the page presents itself. It used to be derived on the client from
+   * whether `eventAt` was set, which made "event" and "drop" the same state on
+   * the wire — the Drop button sent an empty patch and the renderer's "until it
+   * drops" copy was unreachable. Two pages can share a timestamp and mean
+   * different things by it, so the intent is stored rather than inferred.
+   */
+  mode: z.enum(['standard', 'event', 'drop']).optional(),
   theme: Theme.optional(),
 });
 
@@ -259,6 +270,17 @@ export const Credentials = z.object({
 });
 
 export const RefreshInput = z.object({ refreshToken: z.string().min(16).max(512) });
+
+/**
+ * Deliberately looser than `RefreshInput`.
+ *
+ * Signing out is the one call that must not be able to fail on the shape of
+ * what it is handed: the client sends whatever token it is holding, and a
+ * truncated or garbage one is exactly the case where signing out matters. A
+ * 400 there would leave the UI deciding whether a failed sign-out is a
+ * sign-out. The cap is still here, because the body is still parsed.
+ */
+export const LogoutInput = z.object({ refreshToken: z.string().max(512).optional() });
 
 // ---------- resolution ----------
 

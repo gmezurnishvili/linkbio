@@ -21,8 +21,9 @@ const ROUTES: readonly Route[] = [
   { methods: ["GET"], segments: ["v1", "me"] },
 
   { methods: ["POST"], segments: ["v1", "profiles"] },
-  { methods: ["GET", "PATCH"], segments: ["v1", "profiles", "*"] },
+  { methods: ["GET", "PATCH", "DELETE"], segments: ["v1", "profiles", "*"] },
   { methods: ["POST"], segments: ["v1", "profiles", "*", "publish"] },
+  { methods: ["POST"], segments: ["v1", "profiles", "*", "unpublish"] },
   { methods: ["POST"], segments: ["v1", "profiles", "*", "handle"] },
   { methods: ["POST"], segments: ["v1", "profiles", "*", "preview"] },
 
@@ -31,6 +32,7 @@ const ROUTES: readonly Route[] = [
   { methods: ["POST"], segments: ["v1", "profiles", "*", "blocks"] },
   { methods: ["PATCH", "DELETE"], segments: ["v1", "profiles", "*", "blocks", "*"] },
   { methods: ["POST"], segments: ["v1", "profiles", "*", "blocks", "*", "move"] },
+  { methods: ["POST"], segments: ["v1", "profiles", "*", "blocks", "*", "refresh"] },
   // A rule belongs to a block, and the whole set is replaced at once.
   { methods: ["PUT"], segments: ["v1", "profiles", "*", "blocks", "*", "rules"] },
 ];

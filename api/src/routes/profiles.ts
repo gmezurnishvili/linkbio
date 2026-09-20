@@ -109,6 +109,30 @@ profiles.post('/:id/publish', async (c) => {
   }
 });
 
+/**
+ * Take the page down without deleting it.
+ *
+ * `publishedVersion: null` is the same state a page has before its first
+ * publish: the public routes 404 and the draft is untouched, so publishing
+ * again puts back exactly what was there. Deleting was the only way to stop
+ * serving a page until now, which is a very expensive way to take a weekend
+ * off.
+ *
+ * The edge is retracted first, for the same reason delete does it first: a
+ * mask or hot link left in the KeyValueStore is the one thing that can still
+ * answer for a handle the origin has stopped serving.
+ */
+profiles.post('/:id/unpublish', async (c) => {
+  const p = c.get('profile');
+  try {
+    await retractRouting(p, await c.var.repo.listBlocks(p.id));
+    const updated = await c.var.repo.updateProfile(p.id, { publishedVersion: null }, ifMatch(c));
+    return c.json(await envelope(c.var.repo, p.id, updated));
+  } catch (e) {
+    return rethrow(e);
+  }
+});
+
 profiles.post('/:id/handle', zValidator('json', ClaimHandle), async (c) => {
   const p = c.get('profile');
   const { handle } = c.req.valid('json');

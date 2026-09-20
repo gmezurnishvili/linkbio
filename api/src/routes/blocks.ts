@@ -5,6 +5,7 @@ import { badRequest, conflict, fromRepo, notFound } from '../errors.ts';
 import { RankExhausted, rankBetween } from '../rank.ts';
 import { newId } from '../ids.ts';
 import { publishRouting } from '../publish.ts';
+import { refreshBlock } from '../feeds/refresh.ts';
 import { envelope, gate } from './mutation.ts';
 import { env } from '../env.ts';
 import { z } from 'zod';
@@ -191,4 +192,36 @@ blocks.delete('/:blockId', async (c) => {
   await c.var.repo.deleteBlock(profileId, removed);
   await republish(c, profileId, { removedBlockIds: [removed] });
   return c.body(null, 204);
+});
+
+/**
+ * Fetch this block's feed now.
+ *
+ * The scheduled refresher is the only thing that ever filled a feed block, and
+ * it runs on a due-time index one TTL apart. That makes the first minutes of a
+ * feed block's life indistinguishable from a broken one: the creator pastes a
+ * channel id, saves, and sees an empty block with no way to tell whether the
+ * ref is wrong or the clock simply has not come round. It is also why a feed
+ * block could never fill at all on a local run, where nothing walks the index.
+ *
+ * So: the same `refreshBlock` the scheduler calls, on demand. The outcome is
+ * returned alongside the block rather than thrown, because "your ref is wrong"
+ * is the answer the creator asked for, not an error in serving it.
+ *
+ * Deliberately outside the version gate. A refresh writes items and timestamps,
+ * never rules or targets, so it cannot change the cache mask and has nothing to
+ * serialize against; bumping the version here would invalidate the editor's
+ * in-flight edits every time a feed ticked.
+ */
+blocks.post('/:blockId/refresh', async (c) => {
+  const profileId = c.get('profile').id;
+  const block = await c.var.repo.getBlock(profileId, c.req.param('blockId'));
+  if (!block) throw notFound('block not found');
+  if (!block.feed) throw badRequest('this block has no feed to refresh');
+
+  const outcome = await refreshBlock(c.var.repo, block);
+  const updated = await c.var.repo.getBlock(profileId, block.id);
+  if (!updated) throw notFound('block not found');
+
+  return c.json({ ...(await envelope(c.var.repo, profileId, updated)), outcome });
 });

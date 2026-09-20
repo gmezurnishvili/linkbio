@@ -106,6 +106,13 @@ function RowBody({
           className="block w-full text-left"
         >
           <span className="flex items-center gap-2">
+            {/* aria-hidden for the same reason the public page hides it: the
+                label beside it already says what this is. */}
+            {block.icon ? (
+              <span aria-hidden="true" className="flex-none text-[0.9375rem] leading-none">
+                {block.icon}
+              </span>
+            ) : null}
             <span
               className={cx(
                 "truncate text-sm font-medium",

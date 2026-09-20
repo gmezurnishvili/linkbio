@@ -102,6 +102,7 @@ a{color:inherit;text-decoration:none}
 .block:hover{border-color:var(--line-strong)}
 .block:active{transform:translateY(1px)}
 .block:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.block-icon{font-size:1.0625rem;line-height:1;flex:none;width:1.25rem;text-align:center}
 .block-label{font-size:.9375rem;font-weight:500;flex:1;min-width:0}
 .block-meta{font-size:.75rem;color:var(--muted);flex:none;max-width:9rem;
  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}

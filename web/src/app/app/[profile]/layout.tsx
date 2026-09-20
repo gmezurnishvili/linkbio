@@ -19,8 +19,16 @@ export default async function ProfileLayout({
   if (!token) redirect("/login");
 
   let profile;
+  let pages: { id: string; handle: string }[] = [];
   try {
-    profile = await api.profile(profileId, { token });
+    // Both in one pass. The switcher needs the list on first paint, and a
+    // second round trip for it would flash a bar with no way out of this page.
+    const [loaded, session] = await Promise.all([
+      api.profile(profileId, { token }),
+      api.session({ token }),
+    ]);
+    profile = loaded;
+    pages = session.profiles.map((p) => ({ id: p.id, handle: p.handle }));
   } catch (err) {
     if (err instanceof ApiError && err.isUnauthorized) redirect("/login?error=expired");
     if (err instanceof ApiError && err.status === 404) notFound();
@@ -29,7 +37,7 @@ export default async function ProfileLayout({
 
   return (
     <ProfileProvider initial={profile}>
-      <PublishBar />
+      <PublishBar pages={pages} />
       <main className="mx-auto max-w-[64rem] px-5 py-6">{children}</main>
     </ProfileProvider>
   );

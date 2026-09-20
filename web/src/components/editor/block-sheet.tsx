@@ -1,10 +1,11 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import type { Block } from "@/lib/api/types";
+import type { Block, FeedOutcome } from "@/lib/api/types";
 import { FEED_SOURCES, feedRefHint, feedRefProblem } from "@/lib/feeds";
 import { resolveEmbed } from "@/lib/site/embed";
 import { describeRule } from "@/lib/rules/language";
+import { fromLocalInput, toLocalInput } from "@/lib/datetime";
 import { Button, Field, Input, Select, Sheet, Toggle } from "@/components/ui/primitives";
 import { RuleBuilder, draftFrom, emptyDraft, normalise, type RuleDraft } from "./rule-builder";
 import { nextPriority } from "./rules-library";
@@ -13,6 +14,7 @@ import { orderedRules, useProfile } from "./profile-store";
 export function BlockSheet({ block, onClose }: { block: Block | null; onClose: () => void }) {
   const { state, ops } = useProfile();
   const [label, setLabel] = useState("");
+  const [icon, setIcon] = useState("");
   const [url, setUrl] = useState("");
   const [feed, setFeed] = useState<NonNullable<Block["feed"]>>(EMPTY_FEED);
   const [draft, setDraft] = useState<RuleDraft | null>(null);
@@ -22,6 +24,7 @@ export function BlockSheet({ block, onClose }: { block: Block | null; onClose: (
   useEffect(() => {
     if (!block) return;
     setLabel(block.label);
+    setIcon(block.icon ?? "");
     setUrl(block.url ?? "");
     setFeed(block.feed ?? EMPTY_FEED);
     setDraft(null);
@@ -39,6 +42,7 @@ export function BlockSheet({ block, onClose }: { block: Block | null; onClose: (
   function save() {
     void ops.updateBlock(block!.id, {
       label,
+      icon: icon.trim(),
       // A link is refused without a destination and an embed is useless without
       // one, so both send it. `checkBlockShape` validates the merged block, so
       // clearing a link's target on a PATCH is a 400 rather than a silent 404
@@ -107,9 +111,26 @@ export function BlockSheet({ block, onClose }: { block: Block | null; onClose: (
         />
       ) : (
         <div className="flex flex-col gap-4">
-          <Field label={block.kind === "header" ? "Text" : "Label"}>
-            <Input value={label} onChange={(e) => setLabel(e.target.value)} />
-          </Field>
+          <div className="flex gap-2">
+            {block.kind !== "header" ? (
+              // Deliberately a plain text field and not a picker. The backend
+              // stores any string up to 64 characters and the renderer prints
+              // it verbatim, so an emoji keyboard is the picker — a curated
+              // set would be a shorter list than the one the OS already has.
+              <Field label="Icon" className="w-20 flex-none">
+                <Input
+                  value={icon}
+                  onChange={(e) => setIcon(e.target.value)}
+                  placeholder="✦"
+                  className="text-center"
+                  maxLength={8}
+                />
+              </Field>
+            ) : null}
+            <Field label={block.kind === "header" ? "Text" : "Label"} className="flex-1">
+              <Input value={label} onChange={(e) => setLabel(e.target.value)} />
+            </Field>
+          </div>
 
           {(block.kind === "link" || block.kind === "embed") && (
             <Field
@@ -187,6 +208,8 @@ export function BlockSheet({ block, onClose }: { block: Block | null; onClose: (
             />
           </div>
 
+          <Schedule block={block} />
+
           <div className="border-t border-line pt-4">
             <p className="text-[0.8125rem] text-muted">Rules on this block</p>
             <ul className="mt-2 flex flex-col gap-1.5">
@@ -231,17 +254,101 @@ export function BlockSheet({ block, onClose }: { block: Block | null; onClose: (
 const EMPTY_FEED = { source: "rss", ref: "", ttlSeconds: 3600 };
 
 /**
- * What the refresher last did with this block.
+ * When this block is on the page at all.
+ *
+ * `activeFrom` and `activeUntil` are evaluated ahead of every rule — outside
+ * the window the block resolves to `hide` with no rule involved — and the TTL
+ * the evaluator returns runs exactly to the next boundary, so a block that
+ * opens at eight is cached until eight and not a second past it. All of that
+ * has been true and tested since the evaluator was written, with no control
+ * anywhere to set the two fields.
+ *
+ * The window is a property of the block, so it saves on change rather than
+ * waiting for the sheet's Save button, which only covers the label and the
+ * destination. Two separate writes to the same block would race for the
+ * version otherwise.
+ */
+function Schedule({ block }: { block: Block }) {
+  const { state, ops } = useProfile();
+  const busy = state.pending.has(block.id);
+
+  const set = (field: "activeFrom" | "activeUntil", value: string) => {
+    const iso = fromLocalInput(value);
+    // null rather than undefined: `toBlockInput` only forwards keys that are
+    // not undefined, so clearing a date has to be an explicit value. The
+    // backend takes null as "no boundary" and an absent key as "leave it".
+    void ops.updateBlock(block.id, { [field]: iso ? Date.parse(iso) : null });
+  };
+
+  const backwards =
+    block.activeFrom && block.activeUntil && block.activeUntil <= block.activeFrom;
+
+  return (
+    <div className="flex flex-col gap-3 border-t border-line pt-4">
+      <div>
+        <p className="text-sm font-medium">When it&rsquo;s up</p>
+        <p className="mt-0.5 text-[0.8125rem] text-muted">
+          Leave both empty and it is always up. Outside the window nobody sees it, and no
+          rule can bring it back.
+        </p>
+      </div>
+
+      <div className="flex gap-2">
+        <Field label="From">
+          <Input
+            type="datetime-local"
+            className="tnum"
+            disabled={busy}
+            value={block.activeFrom ? toLocalInput(new Date(block.activeFrom)) : ""}
+            onChange={(e) => set("activeFrom", e.target.value)}
+          />
+        </Field>
+        <Field label="Until">
+          <Input
+            type="datetime-local"
+            className="tnum"
+            disabled={busy}
+            value={block.activeUntil ? toLocalInput(new Date(block.activeUntil)) : ""}
+            onChange={(e) => set("activeUntil", e.target.value)}
+          />
+        </Field>
+      </div>
+
+      {backwards ? (
+        <p className="text-[0.8125rem] text-alert">
+          Until is before From, so this block never shows. The server refuses this pair —
+          fix one of them.
+        </p>
+      ) : null}
+    </div>
+  );
+}
+
+/**
+ * What the refresher last did with this block, and a way to make it do it now.
  *
  * A feed block with no items renders as nothing at all on the public page, and
  * from the editor that is indistinguishable from the block not having saved.
  * This is the only place the difference is visible, so it says which it is.
+ *
+ * "Fetch now" is not a convenience. The scheduler runs one TTL apart, so
+ * without it a creator who pastes the wrong channel id waits an hour to find
+ * out — and learns nothing, because the error lands on a row they cannot see.
  */
 function FeedStatus({ block }: { block: Block }) {
+  const { state, ops } = useProfile();
+  const [outcome, setOutcome] = useState<FeedOutcome | null>(null);
+  const busy = state.pending.has(`${block.id}:feed`);
+
   const count = block.items?.length ?? 0;
   const fetched = block.feedRefreshedAt
     ? new Date(block.feedRefreshedAt).toLocaleString()
     : null;
+
+  const fetchNow = async () => {
+    setOutcome(null);
+    setOutcome(await ops.refreshFeed(block.id));
+  };
 
   return (
     <div className="rounded-desk bg-sunk px-3 py-2.5 text-[0.8125rem]">
@@ -249,6 +356,12 @@ function FeedStatus({ block }: { block: Block }) {
         <>
           <p className="text-alert">Last refresh failed</p>
           <p className="mt-1 text-muted">{block.feedError}</p>
+          {block.feedFailures && block.feedFailures > 1 ? (
+            <p className="mt-1 text-faint">
+              {block.feedFailures} attempts in a row. Each failure doubles the wait before
+              the next one.
+            </p>
+          ) : null}
           {count > 0 && (
             <p className="mt-1 text-muted">
               Still showing {count} item{count === 1 ? "" : "s"} from {fetched}.
@@ -261,9 +374,35 @@ function FeedStatus({ block }: { block: Block }) {
         </p>
       ) : (
         <p className="text-muted">
-          Not fetched yet. Feeds fill in on a schedule, so a new block stays empty for a few minutes.
+          Not fetched yet. Feeds fill in on a schedule, so a new block stays empty for a few
+          minutes — or fetch it now.
         </p>
       )}
+
+      {/* The outcome of *this* click, which is not always the same thing as the
+          block's stored state: an `unconfigured` source leaves no feedError
+          behind, because a missing credential is not the creator's fault and
+          should not back their block off. */}
+      {outcome?.status === "unconfigured" ? (
+        <p className="mt-1.5 text-clock">
+          This source isn&rsquo;t configured on the server, so nothing can be fetched from it
+          yet.
+        </p>
+      ) : outcome?.status === "ok" ? (
+        <p className="mt-1.5 text-live">
+          Fetched {outcome.items} item{outcome.items === 1 ? "" : "s"}.
+        </p>
+      ) : null}
+
+      <Button
+        size="sm"
+        variant="quiet"
+        className="mt-2"
+        disabled={busy || !block.feed?.ref}
+        onClick={() => void fetchNow()}
+      >
+        {busy ? "Fetching" : "Fetch now"}
+      </Button>
     </div>
   );
 }

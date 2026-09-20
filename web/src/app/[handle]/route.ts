@@ -135,6 +135,7 @@ const NOT_FOUND_HTML = `<!DOCTYPE html>
 <title>Not here</title>
 <style>body{margin:0;min-height:100vh;display:grid;place-items:center;
 background:#f4f5f7;color:#141a22;font:16px/1.5 -apple-system,BlinkMacSystemFont,sans-serif}
-div{text-align:center;padding:2rem}p{color:#6b7480;margin:.5rem 0 0;font-size:.9375rem}</style>
+div{text-align:center;padding:2rem}p{color:#6b7480;margin:.5rem 0 0;font-size:.9375rem}
+a{color:inherit}</style>
 </head><body><div><strong>This handle isn't taken.</strong>
-<p>If it's yours, claim it.</p></div></body></html>`;
+<p>If it's yours, <a href="/signup">claim it</a>.</p></div></body></html>`;

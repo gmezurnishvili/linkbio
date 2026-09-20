@@ -1,5 +1,7 @@
 import type { TRule } from './schema.ts';
 
+export type PageMode = 'standard' | 'event' | 'drop';
+
 export type User = {
   id: string;
   email: string;
@@ -22,6 +24,8 @@ export type Profile = {
   bio?: string;
   avatarUrl?: string;
   eventAt?: number | null;
+  /** Stored, not derived from `eventAt` — see `ProfileCreate` in ./schema.ts. */
+  mode?: PageMode;
   theme?: Record<string, string>;
   version: number;
   /** The version last published. Null means the page has never been published. */
@@ -39,8 +43,8 @@ export type Block = {
   target?: string;
   icon?: string;
   hidden: boolean;
-  activeFrom?: number;
-  activeUntil?: number;
+  activeFrom?: number | null;
+  activeUntil?: number | null;
   rules: TRule[];
   feed?: { source: string; ref: string; ttlSeconds: number };
   items?: Array<{ title: string; subtitle?: string; href?: string }>;

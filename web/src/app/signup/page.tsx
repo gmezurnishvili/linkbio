@@ -10,7 +10,10 @@ async function register(formData: FormData) {
   const email = String(formData.get("email") ?? "").trim();
   const password = String(formData.get("password") ?? "");
   if (!email || !password) redirect("/signup?error=missing");
-  if (password.length < 10) redirect("/signup?error=short");
+  // 8, which is what `Credentials` in the backend enforces. It used to be 10
+  // here, so a password the API would have accepted was refused by the form
+  // with a message quoting a different number than the docs did.
+  if (password.length < 8) redirect("/signup?error=short");
 
   let tokens;
   try {
@@ -35,7 +38,7 @@ async function register(formData: FormData) {
 
 const MESSAGES: Record<string, string> = {
   missing: "Enter an email and a password.",
-  short: "Ten characters at least.",
+  short: "Eight characters at least.",
   taken: "There's already an account on this email. Sign in instead.",
   unavailable: "Couldn't create the account. Try again in a moment.",
 };
@@ -74,7 +77,7 @@ export default async function SignupPage({
               type="password"
               autoComplete="new-password"
               required
-              minLength={10}
+              minLength={8}
               className="h-10 rounded-desk border border-line bg-panel px-3 text-[0.9375rem] outline-none focus:border-geo"
             />
             <span className="text-[0.75rem] text-faint">Ten characters or more.</span>

@@ -14,6 +14,7 @@ import {
   ApiError,
   type Block,
   type CacheDimension,
+  type FeedOutcome,
   type Profile,
 } from "@/lib/api/types";
 import type { BlockRule } from "@/lib/rules/schema";
@@ -133,7 +134,18 @@ export interface ProfileOps {
   deleteBlock(blockId: string): Promise<void>;
   /** Replaces the block's whole rule set. Returns false if the write did not land. */
   saveBlockRules(blockId: string, rules: BlockRule[]): Promise<boolean>;
+  /**
+   * Fetches the block's feed now and reports what happened. `null` means the
+   * call itself did not land (offline, conflict lock, expired session); an
+   * outcome with status "failed" means it landed and the feed did not, which
+   * is the answer the creator is actually asking for.
+   */
+  refreshFeed(blockId: string): Promise<FeedOutcome | null>;
   publish(): Promise<void>;
+  /** Takes the page down; the draft survives and can be published again. */
+  unpublish(): Promise<void>;
+  /** Deletes the page and everything on it. Irreversible; navigates away. */
+  deleteProfile(): Promise<boolean>;
   reload(): Promise<void>;
   dismissError(): void;
 }
@@ -366,8 +378,36 @@ export function ProfileProvider({
         return true;
       },
 
+      async refreshFeed(blockId) {
+        // No version is sent. A refresh writes items and timestamps, never
+        // rules or targets, so the backend does not gate it and does not bump
+        // the version — passing If-Match here would make a feed tick able to
+        // lose a race with the creator's own edit for no reason.
+        const res = await guard(`${blockId}:feed`, () => api.refreshFeed(pid, blockId));
+        if (!res.ok) return null;
+        dispatch({ type: "upsertBlock", block: toBlock(res.value.data) });
+        return res.value.outcome;
+      },
+
       async publish() {
         const res = await guard("publish", (version) => api.publish(pid, { version }));
+        if (!res.ok) return;
+        dispatch({
+          type: "replace",
+          profile: withBlocks(res.value.data, res.value.cacheDimensions),
+        });
+        applyVersion(res.value.version, res.value.cacheDimensions);
+      },
+
+      async deleteProfile() {
+        const res = await guard("profile:delete", (version) =>
+          api.deleteProfile(pid, { version }),
+        );
+        return res.ok;
+      },
+
+      async unpublish() {
+        const res = await guard("publish", (version) => api.unpublish(pid, { version }));
         if (!res.ok) return;
         dispatch({
           type: "replace",

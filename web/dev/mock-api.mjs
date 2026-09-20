@@ -23,6 +23,18 @@
  *     API and 3600 from here.
  *
  * Anywhere the two disagree, the real one is right.
+ *
+ * It used to be the only thing in the repository that shipped seeded data,
+ * which made it the path of least resistance for a demo — on the worst
+ * possible path, since the divergences above are exactly the properties worth
+ * judging. `npm run seed` in ../../api now builds the same page against the
+ * real backend over HTTP, so there is no longer a reason to evaluate the
+ * product here.
+ *
+ * It also stops short of the current contract: /v1/auth/logout,
+ * /v1/profiles/:id/unpublish, DELETE /v1/profiles/:id and
+ * /v1/profiles/:id/blocks/:bid/refresh exist on the real API and not here, so
+ * sign-out, unpublish, delete and "fetch now" all 404 against this.
  */
 
 import { createServer } from "node:http";

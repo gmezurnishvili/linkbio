@@ -19,16 +19,10 @@ npm install                 # no new dependencies, but harmless
 copy .env.example .env.local
 ```
 
-**Do the `copy .env.example .env.local` step even though `web\.env.local`
-already exists.** The existing one still points the click beacon at
-`/v1/beacon`, a path that has never existed on the backend, so every beacon
-404s. I fixed `.env.example` and the in-code default but the file tooling
-refuses to write `.env.local`, so that one line is yours. Overwrite the file, or
-just change the one line to:
-
-```
-NEXT_PUBLIC_BEACON_URL=http://localhost:8787/v1/events
-```
+`web\.env.local` is now correct — it used to point the click beacon at
+`/v1/beacon`, a path that has never existed on the backend, and since Next gives
+`.env.local` precedence over `.env` that was the value the browser got. Nothing
+to do by hand.
 
 ---
 
@@ -65,16 +59,49 @@ Error: invalid configuration
 Data lives in memory, so restarting the API wipes every account and page. That
 is what `DB_DRIVER=memory` means; there is no database to install.
 
+With `DB_DRIVER=memory` the API also runs the feed refresher in-process, once a
+minute. In production that is a separate Lambda on a schedule reading the same
+DynamoDB rows; against memory there is no shared table, so a separate process
+would scan its own empty heap and a feed block could never fill. Set
+`FEED_REFRESH_INTERVAL_MS=0` to turn it off.
+
+---
+
+## A page to look at
+
+```powershell
+cd api
+npm run seed
+```
+
+Registers `demo@linkbio.local` / `demo-password-1234`, builds `/giorgi` with
+four blocks and four rules — one geo, one device, one time window, one RSS feed
+— and publishes it. Re-running it signs in rather than re-registering and leaves
+existing blocks alone.
+
+This exists so the real backend is demoable. The seeded page inside
+`web/dev/mock-api.mjs` used to be the only one in the repository, which made the
+mock the easiest way to evaluate the product on the one path whose rule
+evaluation is a documented approximation.
+
 ---
 
 ## Then, in the browser
 
 1. `http://localhost:3000/signup` — any email and a password of 8+ characters.
 2. `/app/new` — pick a handle. Availability is checked as you type.
-3. `/app/<id>` — add a block or two, open one and add a rule.
+3. `/app/<id>` — add a block or two, open one and add a rule. A block also
+   carries an icon, a visibility toggle and a "when it's up" window; a feed
+   block has a **Fetch now** button rather than waiting on the schedule.
 4. **Publish.** This matters now: a page with `publishedVersion: null` is a
    draft and `/<handle>` returns 404 until you publish it. The editor says so.
-5. `/<handle>` — the public page, or "View live" in the header.
+5. `/<handle>` — the public page, or "View live" in the header. Every link on
+   it goes through `/r/<handle>/<blockId>`, which evaluates the rules for that
+   visitor and 302s. In production CloudFront routes `/r/*` to the API origin
+   directly; the Next route handler is what makes it work anywhere else.
+6. The handle in the top-left is a switcher: it lists every page on the account
+   and carries **+ New page**. Sign out is next to Publish, and Settings holds
+   unpublish, sign-out-everywhere and delete.
 
 ---
 
@@ -85,13 +112,12 @@ cd web
 npm run dev:mock        # mock API on 8787, Next on 3000
 ```
 
-The mock now implements the same contract as the real backend — same paths, same
-`{ data, version, cacheDimensions }` envelope, same two flavours of 409, same
-refresh-token rotation. The two are interchangeable. It also ships a seeded
-`/giorgi` profile with rules already set up, which the real backend does not,
-so it is the faster way to see the simulator do something.
+Sign in there with `you@studio.com` and any password to get its seeded profile.
 
-Sign in there with `you@studio.com` and any password to get the seeded profile.
+Prefer the real backend with `npm run seed` now. The mock implements the
+contract closely but its rule evaluation is an approximation that errs
+optimistic — see the header of `dev/mock-api.mjs` — and it has not grown the
+newer routes, so sign-out, unpublish, delete and "fetch now" 404 against it.
 
 ---
 
@@ -127,12 +153,12 @@ the `s-maxage` and destination each one gets. It expects a published profile at
 
 ```powershell
 cd api
-npm test            # 331 tests
+npm test            # 413 tests
 npm run typecheck   # covers src/, test/ and infra/
 npx cdk synth       # the stack actually synthesizes now
 
 cd ..\web
-npm test            # 86 tests
+npm test            # vitest; needs a node_modules installed for this OS
 npm run typecheck
 ```
 

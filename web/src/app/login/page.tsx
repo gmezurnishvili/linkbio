@@ -35,16 +35,25 @@ const MESSAGES: Record<string, string> = {
 export default async function LoginPage({
   searchParams,
 }: {
-  searchParams: Promise<{ error?: string }>;
+  searchParams: Promise<{ error?: string; signedout?: string }>;
 }) {
-  const { error } = await searchParams;
+  const { error, signedout } = await searchParams;
   const message = error ? MESSAGES[error] ?? MESSAGES.denied : null;
+  // Signing out lands here, and a sign-in form with nothing said on it looks
+  // like the session simply expired.
+  const notice = !message && signedout === "1" ? "You're signed out." : null;
 
   return (
     <main className="grid min-h-screen place-items-center px-6">
       <div className="w-full max-w-[21rem]">
         <h1 className="text-[1.375rem] font-semibold tracking-[-0.018em]">Sign in</h1>
         <p className="mt-1 text-sm text-muted">Your pages keep serving while you're away.</p>
+
+        {notice ? (
+          <p role="status" className="mt-3 rounded-desk bg-sunk px-3 py-2 text-[0.8125rem]">
+            {notice}
+          </p>
+        ) : null}
 
         <form action={signIn} className="mt-7 flex flex-col gap-3">
           <label className="flex flex-col gap-1.5">

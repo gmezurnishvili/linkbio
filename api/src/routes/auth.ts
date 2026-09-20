@@ -3,9 +3,9 @@ import { zValidator } from '@hono/zod-validator';
 import { SignJWT } from 'jose';
 import { randomBytes, scrypt, timingSafeEqual, createHash } from 'node:crypto';
 import { promisify } from 'node:util';
-import { Credentials, RefreshInput } from '../domain/schema.ts';
+import { Credentials, LogoutInput, RefreshInput } from '../domain/schema.ts';
 import { fromRepo, tooMany, unauthorized } from '../errors.ts';
-import { SELF_AUDIENCE, SELF_ISSUER } from '../auth.ts';
+import { SELF_AUDIENCE, SELF_ISSUER, requireAuth } from '../auth.ts';
 import { env } from '../env.ts';
 import type { Repo } from '../db/repo.ts';
 import type { Env } from '../app.ts';
@@ -136,6 +136,44 @@ auth.post('/refresh', zValidator('json', RefreshInput), async (c) => {
     throw unauthorized('refresh token is not valid');
   }
   return c.json(await issue(c.var.repo, rec.userId));
+});
+
+/**
+ * Sign out of this session.
+ *
+ * Only the presented refresh token is destroyed, so a sign-out on one device
+ * does not log the same account out on another — which is the behaviour anyone
+ * expects and, until now, the behaviour nobody could get: `revokeRefreshTokens`
+ * existed with no route in front of it and the only thing that ever cleared a
+ * session was a 401 from upstream. A shared machine kept the session for the
+ * full 30-day refresh lifetime.
+ *
+ * Always 204, even for a token that is expired, already used or gibberish.
+ * Reporting which is a free oracle on whether a stolen token is still live, and
+ * there is nothing the caller could do differently either way: it is signed out
+ * regardless, because the client drops the token on the floor.
+ */
+auth.post('/logout', zValidator('json', LogoutInput), async (c) => {
+  throttle(`out:${clientKey(c)}`, 60);
+  const { refreshToken } = c.req.valid('json');
+  const userId = refreshToken?.split('.')[0] ?? '';
+  if (userId && refreshToken) await c.var.repo.consumeRefreshToken(userId, hashToken(refreshToken));
+  return c.body(null, 204);
+});
+
+/**
+ * Sign out everywhere.
+ *
+ * Authenticated rather than token-bearing: "end every session" is a security
+ * action taken by someone who is signed in and believes another session is not
+ * theirs, and it should not be reachable by holding one of the tokens under
+ * suspicion. It is also the whole of the recovery story for a leaked token
+ * until there is a session list to revoke from.
+ */
+auth.post('/logout/all', requireAuth, async (c) => {
+  const { userId } = c.get('auth');
+  await c.var.repo.revokeRefreshTokens(userId);
+  return c.body(null, 204);
 });
 
 // Generated once at module load; its only job is to cost the same as a real one.

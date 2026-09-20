@@ -28,8 +28,8 @@ export type Block = {
   id: string;
   defaultTarget: string;
   rules: Rule[];
-  activeFrom?: number; // absolute epoch ms
-  activeUntil?: number;
+  activeFrom?: number | null; // absolute epoch ms; null is "no boundary"
+  activeUntil?: number | null;
 };
 
 export type Decision = {

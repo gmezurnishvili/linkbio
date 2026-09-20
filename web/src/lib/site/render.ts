@@ -210,9 +210,23 @@ function linkBlock(b: ResolvedBlock, handle: string): string {
   const href = b.href ?? `/${handle}/l/${b.slug ?? b.id}`;
   return `<a class="block" href="${esc(safeHref(href))}"
   data-block="${esc(b.id)}"${b.slug ? ` data-slug="${esc(b.slug)}"` : ""}>
-  <span class="block-label">${esc(b.label)}</span>
+  ${icon(b.icon)}<span class="block-label">${esc(b.label)}</span>
   <span class="block-meta">${esc(destinationHint(b.target))}</span>
 </a>`;
+}
+
+/**
+ * The block's glyph, if it has one.
+ *
+ * `aria-hidden`, because it is decoration sitting next to a label that already
+ * says what the link is — a screen reader announcing "rocket Pre-order" is
+ * worse than one announcing "Pre-order". Escaped like any other creator input;
+ * the backend caps it at 64 characters and does not constrain what is in it.
+ */
+function icon(value: string | undefined): string {
+  const trimmed = (value ?? "").trim();
+  if (!trimmed) return "";
+  return `<span class="block-icon" aria-hidden="true">${esc(trimmed)}</span>\n  `;
 }
 
 function feedBlock(b: ResolvedBlock): string {

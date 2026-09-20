@@ -22,6 +22,7 @@ import {
   type WireSession,
   type WireVisitorContext,
 } from "./types";
+import type { FeedOutcome } from "./types";
 import type { BlockRule } from "@/lib/rules/schema";
 
 /**
@@ -188,6 +189,28 @@ export const api = {
   publish: (profileId: string, o?: CallOptions) =>
     call<Mutation<WireProfile>>("POST", `/v1/profiles/${id(profileId)}/publish`, {}, o),
 
+  /**
+   * Takes the page down and keeps the draft. The public routes 404 again, which
+   * is the same state the page was in before its first publish — so publishing
+   * later puts back exactly what was there.
+   */
+  unpublish: (profileId: string, o?: CallOptions) =>
+    call<Mutation<WireProfile>>("POST", `/v1/profiles/${id(profileId)}/unpublish`, {}, o),
+
+  /**
+   * Deletes the page and everything on it.
+   *
+   * The backend retracts the edge routing before it drops the rows, which is
+   * the ordering that matters: a hot link left in the KeyValueStore would keep
+   * redirecting visitors to a deleted page's destination long after the page
+   * itself stopped existing. Nothing here has to know that — it is noted
+   * because the reverse order would look identical from this side.
+   *
+   * 204, no body, no undo.
+   */
+  deleteProfile: (profileId: string, o?: CallOptions) =>
+    callEmpty("DELETE", `/v1/profiles/${id(profileId)}`, undefined, o),
+
   /** Unauthenticated, and a property of the namespace rather than of a profile. */
   checkHandle: (handle: string, o?: CallOptions) =>
     call<HandleCheck>("GET", `/v1/handles/${id(handle)}`, undefined, o),
@@ -245,6 +268,23 @@ export const api = {
       o,
     ),
 
+  /**
+   * Fetch this block's feed now, instead of waiting for the scheduler.
+   *
+   * The refresher runs one TTL apart, so a newly added feed block is empty for
+   * up to an hour and a wrong channel id is indistinguishable from a slow one.
+   * The outcome comes back with the block: `unconfigured` is an operator
+   * problem (a missing credential), `failed` carries the message the adapter
+   * threw, and both are answers rather than errors.
+   */
+  refreshFeed: (profileId: string, blockId: string, o?: CallOptions) =>
+    call<Mutation<WireBlock> & { outcome: FeedOutcome }>(
+      "POST",
+      `/v1/profiles/${id(profileId)}/blocks/${id(blockId)}/refresh`,
+      {},
+      o,
+    ),
+
   /* ---- rules ------------------------------------------------------------ */
 
   /**
@@ -299,9 +339,10 @@ export function toProfile(
     displayName: wire.title,
     bio: wire.bio ?? "",
     avatarUrl: wire.avatarUrl,
-    // Derived, because the backend has no `mode` column. An instant on the
-    // profile is what makes it an event page; "drop" cannot survive a reload.
-    mode: wire.eventAt ? "event" : "standard",
+    // Stored on the profile. The fallback is for rows written before the
+    // column existed: an instant on the page meant "event" by definition then,
+    // and reading them as standard would silently hide a live countdown.
+    mode: wire.mode ?? (wire.eventAt ? "event" : "standard"),
     eventAt: wire.eventAt ? new Date(wire.eventAt).toISOString() : undefined,
     theme: toTheme(wire.theme),
     blocks: blocks.map(toBlock),
@@ -325,6 +366,9 @@ export function toBlock(wire: WireBlock): Block {
     activeUntil: wire.activeUntil,
     feed: wire.feed,
     feedRefreshedAt: wire.feedRefreshedAt,
+    feedAttemptedAt: wire.feedAttemptedAt,
+    feedFailures: wire.feedFailures,
+    feedError: wire.feedError,
     items: wire.items,
   };
 }
@@ -364,6 +408,7 @@ export function toResolution(wire: WireResolution): Resolution {
     // place. The two vocabularies are the same set now.
     kind: b.kind,
     label: b.label,
+    icon: b.icon,
     // The redirector, not the destination: the click has to be counted, and on
     // a page whose target varies by viewer the destination is not a property of
     // the link anyway.
@@ -382,7 +427,7 @@ export function toResolution(wire: WireResolution): Resolution {
       displayName: wire.title,
       bio: wire.bio ?? "",
       avatarUrl: wire.avatarUrl,
-      mode: wire.eventAt ? "event" : "standard",
+      mode: wire.mode ?? (wire.eventAt ? "event" : "standard"),
       eventAt: wire.eventAt ? new Date(wire.eventAt).toISOString() : undefined,
       theme: toTheme(wire.theme),
     },
@@ -428,16 +473,19 @@ function toProfilePatch(
   if (patch.displayName !== undefined) out.title = patch.displayName;
   if (patch.bio !== undefined) out.bio = patch.bio;
   if (patch.avatarUrl !== undefined) out.avatarUrl = patch.avatarUrl;
+  if (patch.mode !== undefined) {
+    out.mode = patch.mode;
+    // Going back to Standard has to clear the date, or the page keeps a
+    // countdown the creator can no longer see a control for. `ProfilePatch`
+    // takes `eventAt` as nullable precisely so this is expressible: omitting a
+    // key means "leave it alone", and only an explicit null means "remove it".
+    if (patch.mode === "standard") out.eventAt = null;
+  }
   if (patch.eventAt !== undefined) {
     const ms = Date.parse(patch.eventAt);
     if (Number.isFinite(ms) && ms > 0) out.eventAt = ms;
   }
   if (patch.theme) out.theme = { ...patch.theme };
-  // `mode` is deliberately absent. It is derived from `eventAt` on the way in,
-  // and `ProfilePatch` has no way to clear a field — `eventAt` is
-  // `z.number().positive().optional()`, so omitting it means "leave it alone"
-  // rather than "remove it". Switching a page back to standard therefore
-  // cannot be expressed on the wire today; it needs `eventAt` to accept null.
   return out;
 }
 

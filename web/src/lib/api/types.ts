@@ -36,7 +36,8 @@ export interface WireProfile {
   title: string;
   bio?: string;
   avatarUrl?: string;
-  eventAt?: number;
+  eventAt?: number | null;
+  mode?: PageMode;
   theme?: Record<string, string>;
   version: number;
   /** Null means the page has never been published, and the public routes 404. */
@@ -59,15 +60,34 @@ export interface WireBlock {
   target?: string;
   icon?: string;
   hidden: boolean;
-  activeFrom?: number;
-  activeUntil?: number;
+  activeFrom?: number | null;
+  activeUntil?: number | null;
   rules: BlockRule[];
   feed?: { source: string; ref: string; ttlSeconds: number };
   items?: { title: string; subtitle?: string; href?: string }[];
   feedRefreshedAt?: number;
+  // The three fields that say why a feed block is empty. They have been on the
+  // backend's `Block` since the refresher was written and were never carried
+  // across, so the editor's feed panel could only ever say "not fetched yet" —
+  // including for a ref that had been failing for a week.
+  feedAttemptedAt?: number;
+  feedFailures?: number;
+  feedError?: string;
   createdAt: number;
   updatedAt: number;
 }
+
+/**
+ * What `POST .../blocks/:id/refresh` reports about the attempt it just made.
+ *
+ * `unconfigured` is deliberately not a failure: it means the deployment has no
+ * credential for that source, which is an operator problem and not something
+ * the creator can fix by editing their ref.
+ */
+export type FeedOutcome =
+  | { blockId: string; status: "ok"; items: number }
+  | { blockId: string; status: "failed"; error: string; failures: number }
+  | { blockId: string; status: "unconfigured"; error: string };
 
 /** The body `POST /v1/profiles/:id/blocks` and `PATCH .../blocks/:bid` accept. */
 export interface WireBlockInput {
@@ -76,8 +96,8 @@ export interface WireBlockInput {
   target?: string;
   icon?: string;
   hidden?: boolean;
-  activeFrom?: number;
-  activeUntil?: number;
+  activeFrom?: number | null;
+  activeUntil?: number | null;
   rules?: BlockRule[];
   feed?: WireBlock["feed"];
   /** Create only: the id of the block to insert after. */
@@ -124,7 +144,8 @@ export interface WireResolution {
   title: string;
   bio?: string;
   avatarUrl?: string;
-  eventAt?: number;
+  eventAt?: number | null;
+  mode?: PageMode;
   theme?: Record<string, string>;
   version: number;
   published: boolean;
@@ -241,8 +262,8 @@ export interface Block {
   /** Embedded, and replaced as a whole set. There is no profile-level pool. */
   rules: BlockRule[];
   /** Epoch ms. Outside this span the block resolves to `hide`, with no rule involved. */
-  activeFrom?: number;
-  activeUntil?: number;
+  activeFrom?: number | null;
+  activeUntil?: number | null;
   /** kind "feed": which adapter fills it, what from, and how often. */
   feed?: { source: string; ref: string; ttlSeconds: number };
   /** Epoch ms of the last fetch that returned items. */
@@ -272,9 +293,10 @@ export interface Profile {
   bio: string;
   avatarUrl?: string;
   /**
-   * Not a backend field. It is derived from `eventAt` on the way in and sent
-   * back as `eventAt` on the way out — a profile with an instant on it is an
-   * event page, one without is a standard page, and "drop" cannot round-trip.
+   * A real backend field now. It used to be derived from whether `eventAt` was
+   * set, which collapsed "event" and "drop" into the same wire state: the Drop
+   * button sent an empty patch, and going back to Standard was inexpressible
+   * because the patch adapter filtered out the null that would clear the date.
    */
   mode: PageMode;
   /** ISO instant. The wire carries epoch ms. */
@@ -330,6 +352,12 @@ export interface ResolvedBlock {
    */
   kind: BlockKind;
   label: string;
+  /**
+   * A short glyph shown before the label — one emoji, in practice. It has been
+   * on the block and in the resolver's output since they were written, and the
+   * renderer never printed it, so setting one did nothing at all.
+   */
+  icon?: string;
   href?: string;
   /**
    * Where `href` will send *this* viewer, which is a different fact from where

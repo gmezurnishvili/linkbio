@@ -83,11 +83,13 @@ export function Field({
   label,
   hint,
   error,
+  className,
   children,
 }: {
   label?: string;
   hint?: string;
   error?: string;
+  className?: string;
   children: ReactNode;
 }) {
   // A <label> with no text names the control it wraps as the empty string,
@@ -95,7 +97,7 @@ export function Field({
   // one, the control carries its own aria-label and this is only a layout box.
   const Wrapper = label ? "label" : "div";
   return (
-    <Wrapper className="flex flex-col gap-1.5">
+    <Wrapper className={cx("flex flex-col gap-1.5", className)}>
       {label ? <span className="text-[0.8125rem] text-muted">{label}</span> : null}
       {children}
       {error ? (

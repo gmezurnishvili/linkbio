@@ -34,10 +34,24 @@ describe("proxy allowlist", () => {
     expect(isAllowedProxyPath("GET", [])).toBe(false);
   });
 
+  it("allows the surfaces that used to 404 from our own proxy", () => {
+    // Each of these existed on the backend with nothing in front of it. The
+    // delete in particular was the confusing one: the endpoint worked, and the
+    // browser got a 404 from this list.
+    expect(isAllowedProxyPath("DELETE", ["v1", "profiles", "p_1"])).toBe(true);
+    expect(isAllowedProxyPath("POST", ["v1", "profiles", "p_1", "unpublish"])).toBe(true);
+    expect(
+      isAllowedProxyPath("POST", ["v1", "profiles", "p_1", "blocks", "b_2", "refresh"]),
+    ).toBe(true);
+  });
+
   it("refuses a method the shape does not have", () => {
-    expect(isAllowedProxyPath("DELETE", ["v1", "profiles", "p_1"])).toBe(false);
     expect(isAllowedProxyPath("POST", ["v1", "me"])).toBe(false);
     expect(isAllowedProxyPath("PUT", ["v1", "profiles", "p_1"])).toBe(false);
+    expect(isAllowedProxyPath("DELETE", ["v1", "profiles", "p_1", "unpublish"])).toBe(false);
+    expect(
+      isAllowedProxyPath("GET", ["v1", "profiles", "p_1", "blocks", "b_2", "refresh"]),
+    ).toBe(false);
   });
 
   it("refuses id segments that would reshape the path once joined", () => {

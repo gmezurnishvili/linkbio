@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { api } from "@/lib/api/client";
 import { ApiError } from "@/lib/api/types";
@@ -16,7 +17,17 @@ import { Button, Chip, Field, Input } from "@/components/ui/primitives";
  * the claim happen in the same transaction server-side — two calls would leave
  * a profile with no handle if the second one lost a race.
  */
-export function Onboarding({ suggestion }: { suggestion: string }) {
+export function Onboarding({
+  suggestion,
+  backTo = null,
+  nth = 1,
+}: {
+  suggestion: string;
+  /** Where to go if they did not mean to be here. Null on a first page. */
+  backTo?: string | null;
+  /** Which page this would be. Only the wording changes. */
+  nth?: number;
+}) {
   const router = useRouter();
   const [handle, setHandle] = useState(suggestion);
   const [displayName, setDisplayName] = useState("");
@@ -88,11 +99,19 @@ export function Onboarding({ suggestion }: { suggestion: string }) {
 
   return (
     <main className="mx-auto max-w-[24rem] px-6 py-16">
-      <h1 className="text-[1.375rem] font-semibold tracking-[-0.018em]">Pick your handle</h1>
+      <h1 className="text-[1.375rem] font-semibold tracking-[-0.018em]">
+        {nth > 1 ? "Pick a handle for this one" : "Pick your handle"}
+      </h1>
       <p className="mt-1 text-sm text-muted">
         This is the address people will type. You can change it later, and the old one
         keeps working for 90 days.
       </p>
+
+      {backTo ? (
+        <Link href={backTo} className="mt-3 inline-block text-[0.8125rem] text-muted hover:text-ink">
+          ← Back to your other pages
+        </Link>
+      ) : null}
 
       <div className="mt-7 flex flex-col gap-4">
         <Field
