@@ -57,6 +57,37 @@ if (!originSecret) {
   );
 }
 
+/**
+ * The custom domain, in two deploys.
+ *
+ *   npm run deploy                                        # no domain, as before
+ *   npx cdk deploy -c domain=chamelink.app                # the hosted zone only
+ *   npx cdk deploy -c domain=chamelink.app -c attachDomain=1
+ *
+ * The second one waits on the registrar: until the domain's delegation points
+ * at the hosted zone's nameservers, ACM cannot validate a certificate for it
+ * and the deploy hangs rather than failing. `stack.ts` has the long version.
+ */
+const domainName: string | undefined =
+  app.node.tryGetContext('domain') || process.env.LINKBIO_DOMAIN || undefined;
+
+const attachDomain = ['1', 'true', 'yes'].includes(
+  String(app.node.tryGetContext('attachDomain') ?? process.env.LINKBIO_ATTACH_DOMAIN ?? '')
+    .trim()
+    .toLowerCase(),
+);
+
+if (attachDomain && !domainName) {
+  throw new Error('attachDomain needs the name too: pass -c domain=example.com alongside it.');
+}
+
+if (domainName && /^https?:|\/|^www\./i.test(domainName)) {
+  throw new Error(
+    `domain must be the bare apex — "example.com", not "${domainName}". ` +
+    'www is added to the certificate and redirected automatically.',
+  );
+}
+
 new LinkbioStack(app, 'Linkbio', {
   env: { account: process.env.CDK_DEFAULT_ACCOUNT, region: process.env.CDK_DEFAULT_REGION ?? 'us-east-1' },
   // CloudFront WebACLs and the KeyValueStore are us-east-1 only.
@@ -66,6 +97,8 @@ new LinkbioStack(app, 'Linkbio', {
   jwtAudience: app.node.tryGetContext('jwtAudience'),
   corsOrigins,
   originSecret,
+  domainName,
+  attachDomain,
   // Off unless asked for: a reservation needs the account to have concurrency
   // to spare, and a new account's whole limit is 10. `-c
   // refresherReservedConcurrency=1` once that has been raised.

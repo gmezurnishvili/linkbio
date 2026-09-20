@@ -10,6 +10,9 @@ import * as wafv2 from 'aws-cdk-lib/aws-wafv2';
 import * as cw from 'aws-cdk-lib/aws-cloudwatch';
 import * as events from 'aws-cdk-lib/aws-events';
 import * as targets from 'aws-cdk-lib/aws-events-targets';
+import * as route53 from 'aws-cdk-lib/aws-route53';
+import * as r53targets from 'aws-cdk-lib/aws-route53-targets';
+import * as acm from 'aws-cdk-lib/aws-certificatemanager';
 import type { Construct } from 'constructs';
 
 export type LinkbioStackProps = StackProps & {
@@ -81,6 +84,28 @@ export type LinkbioStackProps = StackProps & {
    * Set it to 1 once the account's concurrency limit has been raised.
    */
   refresherReservedConcurrency?: number;
+  /**
+   * The custom domain, apex form: `chamelink.app`, not `www.chamelink.app` and
+   * not a URL.
+   *
+   * On its own it creates a public hosted zone and nothing else. That is the
+   * first half of a deliberate two-step — see `attachDomain`.
+   */
+  domainName?: string;
+  /**
+   * Issue the certificate, put `domainName` on the distribution, and point the
+   * zone's records at it. **Only once the registrar's delegation is live.**
+   *
+   * ACM validates a DNS challenge by resolving it over the public internet, so
+   * the record CDK writes into the hosted zone is worth nothing until the
+   * registrar has been told to delegate the domain to that zone's four
+   * nameservers. Set this before then and CloudFormation sits in
+   * CREATE_IN_PROGRESS asking resolvers that still answer with the registrar's
+   * own nameservers, until the validation times out, and then rolls the whole
+   * stack back. Splitting the two turns the wait for a registrar into a wait
+   * rather than a failed deploy.
+   */
+  attachDomain?: boolean;
 };
 
 export class LinkbioStack extends Stack {
@@ -512,8 +537,55 @@ export class LinkbioStack extends Stack {
       }],
     };
 
+    // ---------- custom domain ----------
+    //
+    // Two deploys, in this order:
+    //
+    //   1. `-c domain=chamelink.app` — creates the hosted zone, changes
+    //      nothing else. Copy the `Nameservers` output into the registrar.
+    //   2. `-c domain=chamelink.app -c attachDomain=1` — once the delegation
+    //      resolves, issues the certificate and moves the site onto the name.
+    //
+    // The reason for the split is in `attachDomain`'s comment above.
+
+    const zone = props?.domainName
+      ? new route53.PublicHostedZone(this, 'Zone', {
+          zoneName: props.domainName,
+          comment: 'Delegated from the registrar; the distribution lives at the apex',
+        })
+      : undefined;
+
+    // The delegation at the registrar names these four servers. Destroying the
+    // zone mints four new ones and costs a second trip to the registrar — and
+    // an outage in between — so the zone outlives the stack.
+    zone?.applyRemovalPolicy(RemovalPolicy.RETAIN);
+
+    /**
+     * One certificate covering the apex and `www`.
+     *
+     * In us-east-1 because CloudFront reads certificates from nowhere else —
+     * which this stack already is, for the KeyValueStore and the WAF.
+     *
+     * `www` is on it even though the apex is the site: the redirect below has
+     * to terminate TLS before it can answer, and a name mismatch shows the
+     * viewer a certificate warning instead of a redirect.
+     */
+    const certificate = zone && props?.domainName && props?.attachDomain
+      ? new acm.Certificate(this, 'Cert', {
+          domainName: props.domainName,
+          subjectAlternativeNames: [`www.${props.domainName}`],
+          validation: acm.CertificateValidation.fromDns(zone),
+        })
+      : undefined;
+
     const dist = new cloudfront.Distribution(this, 'Cdn', {
       defaultBehavior: pageBehavior,
+      // The alternate domain names arrive with the certificate and not before:
+      // CloudFront rejects a distribution that claims a name it has no
+      // certificate for, and the first deploy deliberately has neither.
+      ...(certificate && props?.domainName
+        ? { domainNames: [props.domainName], certificate }
+        : {}),
       // Order matters: CloudFront takes the first pattern that matches, not the
       // most specific one. `/_next/static/*` has to precede `/_next/*`, and the
       // dashboard paths have to precede the default, which would otherwise
@@ -577,6 +649,62 @@ export class LinkbioStack extends Stack {
       enableLogging: true,
     });
 
+    // ---------- the domain's records ----------
+
+    if (zone && certificate && props?.domainName) {
+      // Alias records, not CNAMEs: a zone apex carries its own SOA and NS
+      // records and so cannot be a CNAME at all. Both families, because the
+      // distribution answers on IPv6 and a v6-only client that gets no AAAA
+      // record has no other way in.
+      const apex = route53.RecordTarget.fromAlias(new r53targets.CloudFrontTarget(dist));
+      new route53.ARecord(this, 'ApexA', { zone, target: apex });
+      new route53.AaaaRecord(this, 'ApexAAAA', { zone, target: apex });
+
+      /**
+       * `www` 301s to the apex, from a distribution whose only job that is.
+       *
+       * Not a behaviour on the main distribution: every behaviour there that
+       * would need the host test already has a viewer-request function, and
+       * CloudFront allows exactly one function per event type per behaviour.
+       * Folding the test into `normalize.js`, `page.js` and `auth-header.js`
+       * would put the same lines into three tested files to serve a hostname
+       * nobody is meant to type, and would still miss `/_next/static/*` and
+       * `/health`, which have no function at all.
+       */
+      const wwwRedirect = new cloudfront.Function(this, 'WwwRedirect', {
+        comment: `301 www.${props.domainName} to the apex`,
+        code: cloudfront.FunctionCode.fromInline(wwwRedirectCode(props.domainName)),
+      });
+
+      const wwwDist = new cloudfront.Distribution(this, 'WwwCdn', {
+        domainNames: [`www.${props.domainName}`],
+        certificate,
+        comment: `Redirects www.${props.domainName} to ${props.domainName}`,
+        // The function answers at the POP, so the request never travels and the
+        // price class only decides which POP that is.
+        priceClass: cloudfront.PriceClass.PRICE_CLASS_100,
+        httpVersion: cloudfront.HttpVersion.HTTP2_AND_3,
+        defaultBehavior: {
+          // Never reached: the function returns a response before CloudFront
+          // looks at the origin. A distribution must name one regardless.
+          origin: new origins.HttpOrigin(dist.distributionDomainName),
+          allowedMethods: cloudfront.AllowedMethods.ALLOW_ALL,
+          cachePolicy: cloudfront.CachePolicy.CACHING_DISABLED,
+          viewerProtocolPolicy: cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
+          functionAssociations: [{
+            function: wwwRedirect,
+            eventType: cloudfront.FunctionEventType.VIEWER_REQUEST,
+          }],
+        },
+      });
+
+      const www = route53.RecordTarget.fromAlias(new r53targets.CloudFrontTarget(wwwDist));
+      new route53.ARecord(this, 'WwwA', { zone, recordName: 'www', target: www });
+      new route53.AaaaRecord(this, 'WwwAAAA', { zone, recordName: 'www', target: www });
+
+      new CfnOutput(this, 'WwwDistributionDomain', { value: wwwDist.distributionDomainName });
+    }
+
     // ---------- alarms ----------
     //
     // The three places the code deliberately keeps going after a failure — the
@@ -611,6 +739,54 @@ export class LinkbioStack extends Stack {
     new CfnOutput(this, 'KvsArn', { value: kvs.keyValueStoreArn });
     new CfnOutput(this, 'FeedRefresherName', { value: refresher.functionName });
     new CfnOutput(this, 'WebFunctionName', { value: webFn.functionName });
-    new CfnOutput(this, 'SiteUrl', { value: `https://${dist.distributionDomainName}` });
+    if (zone) {
+      new CfnOutput(this, 'HostedZoneId', { value: zone.hostedZoneId });
+      // The four names the registrar has to be told to delegate to. Nothing
+      // about the domain works until they are live there — including, and
+      // first of all, the certificate `attachDomain` asks ACM for.
+      new CfnOutput(this, 'Nameservers', { value: Fn.join(', ', zone.hostedZoneNameServers ?? []) });
+    }
+    new CfnOutput(this, 'SiteUrl', {
+      value: certificate && props?.domainName
+        ? `https://${props.domainName}`
+        : `https://${dist.distributionDomainName}`,
+    });
   }
+}
+
+/**
+ * The entire `www` distribution: a 301 to the same path on the apex.
+ *
+ * Inline rather than a file in `edge/`, because the host it redirects to is a
+ * deploy-time value and a file with a placeholder in it is a file that cannot
+ * be run or tested on its own either.
+ *
+ * The query string is rebuilt by hand. CloudFront hands a function a decoded
+ * object and a `Location` header is a URL, so every name and value goes back
+ * through `encodeURIComponent`; dropping the query instead would quietly eat
+ * the `?utm_source=` off every `www` link a campaign ever printed.
+ */
+function wwwRedirectCode(host: string): string {
+  return `function handler(event) {
+  var request = event.request;
+  var query = '';
+  var names = Object.keys(request.querystring);
+  for (var i = 0; i < names.length; i++) {
+    var name = encodeURIComponent(names[i]);
+    var entry = request.querystring[names[i]];
+    var values = entry.multiValue || [entry];
+    for (var j = 0; j < values.length; j++) {
+      var value = values[j].value;
+      query += (query ? '&' : '?') + name + (value === '' ? '' : '=' + encodeURIComponent(value));
+    }
+  }
+  return {
+    statusCode: 301,
+    statusDescription: 'Moved Permanently',
+    headers: {
+      location: { value: 'https://${host}' + request.uri + query },
+      'cache-control': { value: 'max-age=3600' },
+    },
+  };
+}`;
 }
