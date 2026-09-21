@@ -17,6 +17,7 @@
  */
 
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { createServer } from 'node:http';
 import { existsSync, readFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
@@ -189,6 +190,49 @@ describe('the web Lambda', () => {
       assert.match(html, /links\.example\.com/);
     }
     assert.doesNotMatch(html, /lambda-url\.[a-z0-9-]+\.on\.aws/);
+  });
+
+  it('serves the homepage at the root, without waking the API', async () => {
+    // `/` used to be a 404: there was no route at all, so the first thing
+    // anyone typing the domain saw was Next's not-found page. It is a route
+    // handler now, and it resolves nothing server-side — a request for the
+    // homepage that reached the API would mean the demo had quietly become a
+    // real resolution.
+    apiCalls = [];
+    const res = await handler(event('/'));
+    assert.equal(res.statusCode, 200);
+    assert.equal(apiCalls.length, 0);
+    assert.match(res.headers['content-type'], /text\/html/);
+
+    const html = text(res);
+    assert.match(html, /reads the room/);
+    // The canonical URL comes from x-forwarded-host, not from the function URL
+    // the request actually arrived on.
+    assert.match(html, /<link rel="canonical" href="https:\/\/links\.example\.com">/);
+    assert.doesNotMatch(html, /lambda-url\.[a-z0-9-]+\.on\.aws/);
+  });
+
+  it('hashes the homepage blocks it actually inlined', async () => {
+    // The whole point of the renderer handing its two inline blocks back: a
+    // hash taken from a second copy of the CSS stops matching the moment a
+    // token changes, and the page then ships with its own styles blocked. A
+    // 200 either way, which is why it is asserted against the built artifact
+    // and not only against the module.
+    const res = await handler(event('/'));
+    const html = text(res);
+    const csp = res.headers['content-security-policy'];
+    const sha = (s) => `sha256-${createHash('sha256').update(s, 'utf8').digest('base64')}`;
+
+    const style = html.match(/<style>([\s\S]*?)<\/style>/)[1];
+    const script = html.match(/<script>([\s\S]*?)<\/script>/)[1];
+    assert.ok(csp.includes(`style-src '${sha(style)}'`), 'style hash does not match');
+    assert.ok(csp.includes(`script-src '${sha(script)}'`), 'script hash does not match');
+  });
+
+  it('lets the edge cache the homepage', async () => {
+    const cc = (await handler(event('/'))).headers['cache-control'];
+    assert.match(cc, /s-maxage=\d+/);
+    assert.match(cc, /stale-while-revalidate=\d+/);
   });
 
   it('404s an unclaimed handle', async () => {

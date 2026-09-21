@@ -453,20 +453,33 @@ SITE=$(aws cloudformation describe-stacks --stack-name Linkbio \
    curl -sS "$SITE/health"          # {"ok":true,"ts":…}
    ```
 
-2. **The dashboard is served, and is not cached.**
+2. **The homepage answers.** `/` had no route at all before this and returned
+   Next's 404, so it is worth one curl:
+   ```bash
+   curl -sS -o /dev/null -w '%{http_code}\n' "$SITE/"     # 200
+   curl -sSI "$SITE/" | grep -iE '^(cache-control|content-security-policy)'
+   ```
+   `s-maxage=600`, deliberately short: nothing here issues a CloudFront
+   invalidation and the homepage has no publish event to purge it, so the TTL
+   is the only thing that makes a deploy visible. The CSP carries two sha256
+   hashes — if the page renders unstyled, the hash and the bytes have drifted
+   and `web/src/lib/site/home.ts` is handing back something other than what it
+   inlined.
+
+3. **The dashboard is served, and is not cached.**
    ```bash
    curl -sSI "$SITE/login" | grep -i '^cache-control'
    # private, no-store  — if this says anything cacheable, /login matched the
    # default behaviour instead of its own, and sessions will cross-contaminate.
    ```
 
-3. **A static chunk comes from the right behaviour.**
+4. **A static chunk comes from the right behaviour.**
    ```bash
    curl -sSI "$SITE/_next/static/chunks/…js" | grep -i '^x-cache'
    # Miss once, then "Hit from cloudfront".
    ```
 
-4. **Seed a page and click a link.** With `API_ORIGIN` pointed at `$SITE`:
+5. **Seed a page and click a link.** With `API_ORIGIN` pointed at `$SITE`:
    ```bash
    cd api && API_ORIGIN=$SITE npm run seed
    curl -sSI "$SITE/giorgi"         | grep -iE '^(cache-control|x-route-boundary)'
@@ -476,7 +489,7 @@ SITE=$(aws cloudformation describe-stacks --stack-name Linkbio \
    boundary — never 301, which a browser would cache past every TTL this
    endpoint computes.
 
-5. **The edge is actually doing its job.** This is the one thing that has never
+6. **The edge is actually doing its job.** This is the one thing that has never
    run anywhere, so check it deliberately:
    ```bash
    # a rule-free link: answered at the edge, so no origin request at all
@@ -494,7 +507,7 @@ SITE=$(aws cloudformation describe-stacks --stack-name Linkbio \
    # mask:giorgi → v<n>|g…   and  hot:giorgi/<blockId> → 302|https://…
    ```
 
-6. **Unpublish, and the page is gone.** `POST /v1/profiles/:id/unpublish`, then
+7. **Unpublish, and the page is gone.** `POST /v1/profiles/:id/unpublish`, then
    `/giorgi` should 404 and the `mask:`/`hot:` keys should be gone.
 
 If something is wrong, the Lambda log groups are `ApiLogs`, `WebLogs` and
