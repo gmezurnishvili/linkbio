@@ -59,7 +59,15 @@ jobs:
       # `build:lambda` rather than `build`: it is the command that produces the
       # deployable artifact, and it pins the NEXT_PUBLIC_* values rather than
       # inheriting whatever .env file happens to be present.
+      #
+      # SITE_ORIGIN matches the `domain` pinned in api/cdk.json. It is a
+      # build-time value baked into canonical URLs, and infra/domain-check.ts
+      # refuses to synthesize a stack that attaches a host the bundle does not
+      # name — so CI builds the artifact the deployed stack actually wants,
+      # rather than one that only passes because nothing was set.
       - run: npm run build:lambda
+        env:
+          SITE_ORIGIN: https://chamelink.app
       # The one part of the deployment with no equivalent in development —
       # the Function URL event translation — exercised against the real bundle.
       - run: node --test test/lambda-handler.test.mjs

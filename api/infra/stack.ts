@@ -106,6 +106,21 @@ export type LinkbioStackProps = StackProps & {
    * rather than a failed deploy.
    */
   attachDomain?: boolean;
+  /**
+   * An existing hosted zone to hold the domain's records, instead of creating
+   * one.
+   *
+   * The zone is `RETAIN`, so it survives being dropped from the stack — which
+   * is exactly what happened on 21 September 2026, when a deploy without
+   * `LINKBIO_DOMAIN` removed every domain resource and left the delegated zone
+   * orphaned but alive. Without this prop the only way back was a second
+   * hosted zone with four different nameservers and a second trip to the
+   * registrar.
+   *
+   * Reusing the zone is also the better shape: a delegation is a fact about
+   * the domain, not about this stack, and it should outlive any one of them.
+   */
+  hostedZoneId?: string;
 };
 
 export class LinkbioStack extends Stack {
@@ -548,17 +563,32 @@ export class LinkbioStack extends Stack {
     //
     // The reason for the split is in `attachDomain`'s comment above.
 
-    const zone = props?.domainName
-      ? new route53.PublicHostedZone(this, 'Zone', {
+    // Either reuse the delegated zone or mint one, never guess: `hostedZoneId`
+    // imports, `createHostedZone` creates, and app.ts refuses to synthesize
+    // with a domain and neither. Importing is the steady state — the zone is
+    // RETAIN and therefore already outlives this stack.
+    let zone: route53.IHostedZone | undefined;
+    let createdZone: route53.PublicHostedZone | undefined;
+
+    if (props?.domainName) {
+      if (props.hostedZoneId) {
+        zone = route53.HostedZone.fromHostedZoneAttributes(this, 'Zone', {
+          hostedZoneId: props.hostedZoneId,
+          zoneName: props.domainName,
+        });
+      } else {
+        createdZone = new route53.PublicHostedZone(this, 'Zone', {
           zoneName: props.domainName,
           comment: 'Delegated from the registrar; the distribution lives at the apex',
-        })
-      : undefined;
-
-    // The delegation at the registrar names these four servers. Destroying the
-    // zone mints four new ones and costs a second trip to the registrar — and
-    // an outage in between — so the zone outlives the stack.
-    zone?.applyRemovalPolicy(RemovalPolicy.RETAIN);
+        });
+        // The delegation at the registrar names these four servers. Destroying
+        // the zone mints four new ones and costs a second trip to the
+        // registrar — and an outage in between — so the zone outlives the
+        // stack. Which is why `hostedZoneId` exists to pick it back up.
+        createdZone.applyRemovalPolicy(RemovalPolicy.RETAIN);
+        zone = createdZone;
+      }
+    }
 
     /**
      * One certificate covering the apex and `www`.
@@ -744,7 +774,11 @@ export class LinkbioStack extends Stack {
       // The four names the registrar has to be told to delegate to. Nothing
       // about the domain works until they are live there — including, and
       // first of all, the certificate `attachDomain` asks ACM for.
-      new CfnOutput(this, 'Nameservers', { value: Fn.join(', ', zone.hostedZoneNameServers ?? []) });
+      // Only a zone this stack created has nameservers to report; an imported
+      // one is already delegated, which is the whole reason it was imported.
+      if (createdZone) {
+        new CfnOutput(this, 'Nameservers', { value: Fn.join(', ', createdZone.hostedZoneNameServers ?? []) });
+      }
     }
     new CfnOutput(this, 'SiteUrl', {
       value: certificate && props?.domainName

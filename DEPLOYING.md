@@ -135,6 +135,14 @@ Order matters: both Lambdas are uploaded as directory assets, and CDK resolves
 them at synth time. A stack synthesized before the builds have run uploads
 whatever was in `dist/` last time, or fails.
 
+> **If a custom domain is live, this is not the command.** The domain reaches
+> the stack only through `LINKBIO_DOMAIN`, `LINKBIO_ATTACH_DOMAIN` and
+> `LINKBIO_HOSTED_ZONE_ID`, and a deploy without them tells CloudFormation to
+> remove the certificate, the apex records and the `www` distribution. Use
+> **[Every deploy after the cutover](#every-deploy-after-the-cutover--the-one-that-has-already-gone-wrong)**
+> instead. Synth refuses the mismatch, but the refusal is a backstop, not the
+> instruction.
+
 **PowerShell** (Windows):
 
 ```powershell
@@ -208,6 +216,8 @@ Three failures worth naming, because the message does not point at the cause:
 | 403 on every POST, GETs fine | Origin Access Control in front of a function URL. See above — it cannot be configured around. |
 | `Refusing to synthesize against a stale bundle` | Exactly what it says: `web/dist` or `api/dist` is older than its source. `npm run deploy` from `api/` does the builds in order. |
 | `npm error code EUSAGE` … `npm exec` usage | Windows PowerShell 5.1 stripped the `--` from `npm run deploy -- -c …`, so npm read `-c` as `--call`. Use the environment variables above instead. |
+| `Refusing to synthesize a contradictory domain configuration` | The domain variables and the built bundle disagree — nearly always a fresh shell that has `SITE_ORIGIN` but not `LINKBIO_DOMAIN` / `LINKBIO_ATTACH_DOMAIN` / `LINKBIO_HOSTED_ZONE_ID`. The message names the missing half. This is a refusal to *remove* the domain, not a problem with it. |
+| A domain deploy that runs for tens of minutes and then errors, after which the apex stops resolving | The domain was dropped from the stack, not broken. Removals run in CloudFormation's cleanup phase, after the update has succeeded, so this is a completed teardown rather than a rollback: the certificate, the apex records and the `www` distribution are gone and the retained hosted zone is orphaned. Recover with `LINKBIO_HOSTED_ZONE_ID` pointing at that zone — never a second `createHostedZone`. |
 | `Refusing to synthesize` immediately after a successful build | The build half did not run, or the staleness check is reading the wrong thing. `cat web/dist/.build-stamp` says when the bundle was actually built; the check reads `builtAtMs` from it rather than a file mtime, because `fs.cp` on Windows preserves the *source* timestamp and copied files in `dist` can look years old. |
 
 ### After a deploy: "Cross-origin request refused" on every write
@@ -268,8 +278,11 @@ Passed as CDK context, e.g. `npx cdk deploy -c corsOrigins=https://example.com`.
 | Context | Effect |
 | --- | --- |
 | `originSecret` | The shared secret CloudFront presents to both origins. Prefer the `LINKBIO_ORIGIN_SECRET` environment variable; this context key exists for CI systems that only pass arguments. Omitted, the function URLs answer anyone who finds them, and synth says so. |
-| `domain` | The apex of a custom domain, e.g. `chamelink.app`. On its own it creates a public hosted zone and nothing else; that is step 1 of the section above. `LINKBIO_DOMAIN` does the same. |
+| `domain` | The apex of a custom domain, e.g. `chamelink.app`. Needs exactly one of `hostedZoneId` or `createHostedZone` alongside it. `LINKBIO_DOMAIN` does the same. |
+| `hostedZoneId` | An existing, already-delegated hosted zone to hold the records — the normal case once the cutover has happened, because the zone is `RETAIN` and outlives the stack. A `/hostedzone/` prefix is stripped. `LINKBIO_HOSTED_ZONE_ID` does the same. |
+| `createHostedZone` | `1` mints a *new* hosted zone. Step 1 of a first cutover and nothing else: a second zone for a delegated domain gets four nameservers the registrar has never heard of. `LINKBIO_CREATE_HOSTED_ZONE` does the same. |
 | `attachDomain` | `1` issues the certificate, puts `domain` on the distribution and points the zone at it. **Only once the registrar's delegation resolves** — before that, ACM cannot validate and the deploy hangs and then rolls back. `LINKBIO_ATTACH_DOMAIN` does the same. |
+| `skipDomainCheck` | Disables the synth-time consistency check on all of the above. There is one honest use — deliberately moving the site back onto the CloudFront name — and it is not a way past an error you have not read. |
 | `refresherReservedConcurrency` | Concurrent executions reserved for the feed refresher. Off by default, because a reservation must leave 10 unreserved in the account and a new account's whole limit is 10. Set it to `1` once that has been raised, to stop two refresher runs overlapping. |
 | `corsOrigins` | Comma-separated exact browser origins allowed to call the API cross-origin. The dashboard is same-origin and needs nothing here; the beacon is a simple request that never preflights. Usually empty. |
 | `jwksUrl`, `jwtIssuer`, `jwtAudience` | Hand identity to an external issuer instead of the API's own tokens. `jwtAudience` is required with `jwksUrl` — without it, every token that issuer has ever minted is accepted. |
@@ -324,8 +337,13 @@ Nothing is serving from it yet, so this changes nothing a visitor can see.
 ```powershell
 cd api
 $env:LINKBIO_ORIGIN_SECRET = "<the same secret as every other deploy>"
-npx cdk deploy -c domain=chamelink.app
+npx cdk deploy -c domain=chamelink.app -c createHostedZone=1
 ```
+
+`createHostedZone` is explicit because creating a zone is only ever right once.
+A domain that already has a delegated zone must reuse it — `hostedZoneId` —
+and synth refuses a `domain` with neither flag rather than quietly minting a
+second zone whose nameservers nobody has been told about.
 
 The secret is not optional here. It is a stack property, so a deploy without it
 removes the custom origin header from CloudFront while both Lambdas still
@@ -369,6 +387,7 @@ $env:SITE_ORIGIN           = "https://chamelink.app"
 $env:LINKBIO_ORIGIN_SECRET = "<the same secret again>"
 $env:LINKBIO_DOMAIN        = "chamelink.app"
 $env:LINKBIO_ATTACH_DOMAIN = "1"
+$env:LINKBIO_CREATE_HOSTED_ZONE = "1"   # still the zone step 1 created
 npm run deploy
 ```
 
@@ -384,12 +403,63 @@ is what carries the canonical URL, the JSON-LD `@id`, `robots.txt` and the
 editor's preview origin.
 
 This deploy takes longer than the others — ACM validation and two CloudFront
-distributions propagating, so fifteen to thirty minutes is normal.
+distributions propagating, so fifteen to thirty minutes is normal. **A long
+deploy is not evidence of a failure here, and neither is an error at the end
+of one: CloudFormation removes resources in a cleanup phase that runs after
+the update has already succeeded, and a failure in that phase is logged and
+forgiven rather than rolled back.**
 
 What it creates: the certificate (apex + `www`, DNS-validated in the zone),
 `chamelink.app` as an alternate domain name on the distribution, A and AAAA
 alias records at the apex, and a second, tiny distribution whose only job is to
 301 `www.chamelink.app` to the apex, with its own A and AAAA records.
+
+### Every deploy after the cutover — the one that has already gone wrong
+
+The domain no longer lives in the environment. `api/cdk.json` pins it:
+
+```json
+"context": {
+  "domain": "chamelink.app",
+  "attachDomain": "1",
+  "hostedZoneId": "Z0942392HYD7F7J4L159"
+}
+```
+
+So the everyday command is the short one again, and it keeps the domain instead
+of removing it:
+
+```powershell
+cd api
+$env:SITE_ORIGIN           = "https://chamelink.app"
+$env:LINKBIO_ORIGIN_SECRET = "<the same secret>"
+npm run deploy
+```
+
+`hostedZoneId` rather than `createHostedZone`, because the zone carries
+`RemovalPolicy.RETAIN` and survives being dropped from the stack — so it is no
+longer certain that the stack owns it, and after any deploy that lost the domain
+it definitely does not. Reusing it by id is the steady state; creating one is a
+first cutover and nothing else.
+
+**Before the pin, leaving the domain variables out did not leave the domain
+alone — it removed it.** On 21 September 2026 a deploy from a fresh PowerShell
+window carried `SITE_ORIGIN` and the origin secret but neither domain variable,
+and CloudFormation deleted the certificate, the apex records and the `www`
+distribution while the bundle it was shipping still named `chamelink.app` in
+every canonical URL. Forty minutes, then an apex that resolved to nothing.
+`claude/linkbio-domain-incident.md` has the full account.
+
+Two things now stand between that and a repeat. The pin above, which git
+remembers and a shell cannot forget; and `api/infra/domain-check.ts`, which
+refuses to synthesize when the built bundle and the stack disagree about the
+site's host — in either direction. A bundle built for `chamelink.app` with no
+domain attached is the outage. A stack attaching `chamelink.app` with a bundle
+built for the CloudFront name, or for nothing at all, ships wrong canonical
+URLs, JSON-LD and `robots.txt`. Both are refused with the fix in the message.
+
+CI builds `web/dist` with `SITE_ORIGIN=https://chamelink.app` for the same
+reason, so its `cdk synth` exercises the shape that actually gets deployed.
 
 ### 4. Verify
 
@@ -432,10 +502,22 @@ degraded page.
 
 `-c attachDomain` unset on the next deploy removes the alternate domain name,
 the records and the `www` distribution, and the site answers on the CloudFront
-name again — which is a DNS change, so a browser that has cached the apex
-records will keep trying for their TTL. The hosted zone is `RETAIN`: destroying
-the stack leaves it, and its nameservers, alone. Deleting the zone by hand mints
-four new nameservers on the way back and means a second trip to the registrar.
+name again. **This is the same thing that happens when you merely forget the
+variables**, which is why synth now refuses to do it silently while the bundle
+still names the domain: to really undo the cutover, rebuild with `SITE_ORIGIN`
+back on the CloudFront name first, so the artifact and the infrastructure agree.
+
+Two things to expect either way. It is a DNS change, so a browser that has
+cached the apex records keeps trying them for their TTL; and `.app` is
+HSTS-preloaded, so any window in which the records still resolve while the
+distribution has already dropped the certificate shows a hard handshake
+failure — "your connection is not secure" — with no way to click through.
+
+The hosted zone is `RETAIN`. Destroying the stack, or dropping the domain from
+it, leaves the zone and its nameservers alone but **no longer part of the
+stack** — so the way back is `hostedZoneId`, not another `createHostedZone`.
+Deleting the zone by hand mints four new nameservers and means a second trip to
+the registrar.
 
 ---
 

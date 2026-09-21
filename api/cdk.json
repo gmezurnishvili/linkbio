@@ -2,6 +2,9 @@
   "app": "node --experimental-strip-types infra/app.ts",
   "watch": { "exclude": ["node_modules/**", "dist/**", "cdk.out/**"] },
   "context": {
+    "domain": "chamelink.app",
+    "attachDomain": "1",
+    "hostedZoneId": "Z0942392HYD7F7J4L159",
     "@aws-cdk/core:checkSecretUsage": true,
     "@aws-cdk/aws-lambda:recognizeLayerVersion": true,
     "@aws-cdk/core:target-partitions": ["aws"]

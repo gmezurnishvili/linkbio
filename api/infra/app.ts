@@ -2,6 +2,7 @@
 import { App } from 'aws-cdk-lib';
 import { LinkbioStack } from './stack.ts';
 import { assertFresh } from './freshness.ts';
+import { assertDomainIntent, bundleHostFrom } from './domain-check.ts';
 
 /**
  * The entrypoint `cdk.json` runs.
@@ -58,34 +59,54 @@ if (!originSecret) {
 }
 
 /**
- * The custom domain, in two deploys.
+ * The custom domain.
  *
- *   npm run deploy                                        # no domain, as before
- *   npx cdk deploy -c domain=chamelink.app                # the hosted zone only
- *   npx cdk deploy -c domain=chamelink.app -c attachDomain=1
+ * First cutover, two deploys, because the wait in the middle belongs to a
+ * registrar:
  *
- * The second one waits on the registrar: until the domain's delegation points
- * at the hosted zone's nameservers, ACM cannot validate a certificate for it
- * and the deploy hangs rather than failing. `stack.ts` has the long version.
+ *   npx cdk deploy -c domain=chamelink.app -c createHostedZone=1
+ *   # paste the four Nameservers at the registrar, wait for the delegation
+ *   npx cdk deploy -c domain=chamelink.app -c createHostedZone=1 -c attachDomain=1
+ *
+ * Afterwards, with the zone delegated and outliving the stack:
+ *
+ *   LINKBIO_DOMAIN=chamelink.app LINKBIO_ATTACH_DOMAIN=1 \
+ *   LINKBIO_HOSTED_ZONE_ID=Z0123456789ABCDEFGHIJ npm run deploy
+ *
+ * `attachDomain` waits on the registrar: until the delegation points at the
+ * zone's nameservers, ACM cannot validate a certificate and the deploy hangs
+ * rather than failing. `stack.ts` has the long version.
+ *
+ * The zone is reused rather than created once a cutover has happened, because
+ * the zone carries `RemovalPolicy.RETAIN` and therefore survives being dropped
+ * from the stack. Creating a second one for the same name is silent and
+ * useless: the registrar still delegates to the first.
  */
 const domainName: string | undefined =
   app.node.tryGetContext('domain') || process.env.LINKBIO_DOMAIN || undefined;
 
-const attachDomain = ['1', 'true', 'yes'].includes(
-  String(app.node.tryGetContext('attachDomain') ?? process.env.LINKBIO_ATTACH_DOMAIN ?? '')
-    .trim()
-    .toLowerCase(),
-);
+const flag = (context: string, env: string | undefined) =>
+  ['1', 'true', 'yes'].includes(String(app.node.tryGetContext(context) ?? env ?? '').trim().toLowerCase());
 
-if (attachDomain && !domainName) {
-  throw new Error('attachDomain needs the name too: pass -c domain=example.com alongside it.');
-}
+const attachDomain = flag('attachDomain', process.env.LINKBIO_ATTACH_DOMAIN);
+const createHostedZone = flag('createHostedZone', process.env.LINKBIO_CREATE_HOSTED_ZONE);
 
-if (domainName && /^https?:|\/|^www\./i.test(domainName)) {
-  throw new Error(
-    `domain must be the bare apex — "example.com", not "${domainName}". ` +
-    'www is added to the certificate and redirected automatically.',
-  );
+/** An existing, already-delegated zone to hold the records. Route 53 prints it with a `/hostedzone/` prefix. */
+const hostedZoneId: string | undefined = (
+  app.node.tryGetContext('hostedZoneId') || process.env.LINKBIO_HOSTED_ZONE_ID || undefined
+)?.replace(/^\/?hostedzone\//i, '');
+
+// Every check in one place, and every one of them answerable before
+// CloudFormation is asked to do anything. See domain-check.ts for the deploy
+// that made this necessary.
+if (!app.node.tryGetContext('skipDomainCheck')) {
+  assertDomainIntent({
+    domainName,
+    attachDomain,
+    hostedZoneId,
+    createHostedZone,
+    bundleHost: bundleHostFrom('../web/dist/.build-stamp'),
+  });
 }
 
 new LinkbioStack(app, 'Linkbio', {
@@ -99,6 +120,7 @@ new LinkbioStack(app, 'Linkbio', {
   originSecret,
   domainName,
   attachDomain,
+  hostedZoneId,
   // Off unless asked for: a reservation needs the account to have concurrency
   // to spare, and a new account's whole limit is 10. `-c
   // refresherReservedConcurrency=1` once that has been raised.
