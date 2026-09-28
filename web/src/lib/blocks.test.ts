@@ -169,6 +169,15 @@ describe("the renderer covers exactly the backend's block kinds", () => {
     expect(html).toContain("&quot;&gt;&lt;script&gt;");
   });
 
+  it("link cards and feed items open in a new tab", () => {
+    const { html } = page([
+      link(),
+      link({ id: "b2", kind: "feed", label: "Latest", items: [{ title: "Ep 1", href: "https://example.com/ep1" }] }),
+    ]);
+    expect(html).toMatch(/<a class="block" href="\/r\/erin\/b1" target="_blank" rel="noopener"/);
+    expect(html).toMatch(/<a class="feed-item" href="https:\/\/example\.com\/ep1" target="_blank" rel="noopener"/);
+  });
+
   it("sameAs points at destinations, not back at our own redirector", () => {
     // Every entry used to be `/r/:handle/:id`, which is a self-reference — the
     // opposite of what sameAs is for.

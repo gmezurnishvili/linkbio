@@ -208,7 +208,7 @@ function embedBlock(b: ResolvedBlock, e: Embed): string {
 
 function linkBlock(b: ResolvedBlock, handle: string): string {
   const href = b.href ?? `/${handle}/l/${b.slug ?? b.id}`;
-  return `<a class="block" href="${esc(safeHref(href))}"
+  return `<a class="block" href="${esc(safeHref(href))}" target="_blank" rel="noopener"
   data-block="${esc(b.id)}"${b.slug ? ` data-slug="${esc(b.slug)}"` : ""}>
   ${icon(b.icon)}<span class="block-label">${esc(b.label)}</span>
   <span class="block-meta">${esc(destinationHint(b.target))}</span>
@@ -240,7 +240,7 @@ function feedBlock(b: ResolvedBlock): string {
         it.subtitle ? `<em>${esc(it.subtitle)}</em>` : ""
       }`;
       return it.href
-        ? `<a class="feed-item" href="${esc(safeHref(it.href))}" data-block="${esc(b.id)}">${row}</a>`
+        ? `<a class="feed-item" href="${esc(safeHref(it.href))}" target="_blank" rel="noopener" data-block="${esc(b.id)}">${row}</a>`
         : `<div class="feed-item">${row}</div>`;
     })
     .join("\n  ")}
